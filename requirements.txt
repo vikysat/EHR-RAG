@@ -1,10 +1,11 @@
 # Pinned versions verified to have wheels for CPython 3.11, 3.12 and 3.14
 # on win_amd64 and manylinux x86_64. pandas 3.x requires Python >= 3.11.
 #
-# torch: on Windows the PyPI wheel is CPU-only. On a CUDA server install torch
-# from the PyTorch index first, e.g.
-#   pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu128
-# (pick the cuXXX tag matching the server driver), then `pip install -r requirements.txt`.
+# torch: on Windows the PyPI wheel is CPU-only. On the GPU server (driver supports
+# CUDA 12.x only) install torch from the cu126 index FIRST, then the rest:
+#   pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu126
+#   pip install -r requirements.txt
+# See README "GPU server (CUDA 12.x)".
 numpy==2.4.6
 pandas==3.0.6
 pyyaml==6.0.3

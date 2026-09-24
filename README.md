@@ -15,12 +15,21 @@ pip install -e .
 Requires Python 3.11+ for the pinned dependencies (pandas 3.x); the code itself
 avoids syntax newer than 3.10.
 
-On a CUDA server, install torch from the PyTorch index **before** the rest:
+### GPU server (CUDA 12.x)
+
+The server's NVIDIA driver supports CUDA 12.x only, so torch **must** be installed
+from the CUDA 12.6 index `https://download.pytorch.org/whl/cu126`, **before** the
+rest of the requirements (otherwise pip installs a different torch build from PyPI):
 
 ```bash
-pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu128   # choose the cuXXX tag for your driver
-pip install -r requirements.txt
+pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu126
+pip install -r requirements.txt   # torch==2.14.0 is already satisfied and is not replaced
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+# expected: 2.14.0+cu126 12.6 True
 ```
+
+Do not use the cu128/cu13x indexes on this server. faiss stays `faiss-cpu` on the
+server too.
 
 ## Data
 
