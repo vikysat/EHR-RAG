@@ -155,3 +155,18 @@ def test_commit_hash_required() -> None:
     assert _commit_hash(SimpleNamespace(config=SimpleNamespace(_commit_hash="abc123")), "m") == "abc123"
     with pytest.raises(RuntimeError, match="revision hash"):
         _commit_hash(SimpleNamespace(config=SimpleNamespace()), "m")
+
+
+def test_zero_score_bm25_excluded_from_fusion(fake_config: Path) -> None:
+    us = _units(fake_config)[12]
+    r = AdmissionRetriever(us, _fake_encoders(), rrf_k=60)
+    # No query token occurs in any unit text: every BM25 score is 0, so fusion = dense order.
+    res = r.search("zzqx wwqv")
+    assert all(s == 0 for _, s in res.bm25)
+    assert [d for d, _ in res.fused] == [d for d, _ in res.dense]
+    # One matching unit: only it enters fusion from BM25; zero-score units get no BM25 credit.
+    res = r.search("FakeDrugB")
+    matched = [d for d, s in res.bm25 if s > 0]
+    assert len(matched) == 1
+    assert res.fused == rrf([matched, [d for d, _ in res.dense]], 60)
+    assert res.fused != rrf([[d for d, _ in res.bm25], [d for d, _ in res.dense]], 60)

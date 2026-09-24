@@ -5,7 +5,8 @@ admission and can only ever return ids from that set.
 
 Assembly (as implemented):
   1. For each section query, rank this admission's units with BM25 and dense,
-     fuse with RRF (optionally rerank the whole fused list with the
+     fuse with RRF (BM25 results with score 0, i.e. no shared term, are excluded
+     from fusion) (optionally rerank the whole fused list with the
      cross-encoder), and keep the top ``top_k_per_query``.
   2. Section list: interleave the section's query results by rank (rank 1 of
      each query in query order, then rank 2, ...), deduped, capped at
@@ -125,7 +126,10 @@ class AdmissionRetriever:
         bm = self._own(self.bm25.rank(query))
         qv = self.encoders.query.encode([query])[0]
         de = self._own(self.dense.rank(qv))
-        fu = self._own(rrf([[d for d, _ in bm], [d for d, _ in de]], self.rrf_k))
+        # Zero-score BM25 results share no term with the query; their order is arbitrary
+        # (document order), so they are excluded from fusion.
+        bm_matched = [d for d, s in bm if s > 0]
+        fu = self._own(rrf([bm_matched, [d for d, _ in de]], self.rrf_k))
         rr = None
         if self.encoders.cross is not None:
             ids = [d for d, _ in fu]
