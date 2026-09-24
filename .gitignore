@@ -13,3 +13,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
+
+# Local-only instruction files (never commit)
+/SPEC.md
+/CLAUDE.md
