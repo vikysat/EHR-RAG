@@ -172,6 +172,127 @@ def cmd_build_units(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_all_units(cfg: dict, ids: list[int]) -> dict:
+    from ehr_rag.evidence.schema import read_units
+
+    out = _units_dir(cfg)
+    return {h: read_units(out / f"{h}.jsonl") for h in ids}
+
+
+def _encoders(cfg: dict) -> "object":
+    from ehr_rag.config import project_root
+    from ehr_rag.retrieval.retrieve import Encoders
+
+    return Encoders.from_config(cfg, project_root(cfg) / "cache")
+
+
+def cmd_retrieve(args: argparse.Namespace) -> int:
+    """Phase 3: run section retrieval for all selected admissions."""
+    from ehr_rag.config import SECTIONS
+    from ehr_rag.retrieval.retrieve import retrieve_admission
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    run = start_run(cfg, "retrieve", command="retrieve")
+    ids = [int(h) for h in args.hadm_ids] if args.hadm_ids else _selected_ids(cfg)
+    units = _load_all_units(cfg, ids)
+    enc = _encoders(cfg)
+    results = {}
+    for h in ids:
+        res = retrieve_admission(units[h], enc, cfg["retrieval"])
+        run.write_json(f"retrieval/{h}.json", res.to_json())
+        results[h] = res
+    for h in ids[: args.show]:
+        res = results[h]
+        by_id = {u.unit_id: u for u in units[h]}
+        print(f"\n{'=' * 100}\nhadm_id {h}  |  primary_dx: {res.primary_dx}  |  "
+              f"{len(units[h])} units in pool  |  evidence: {len(res.evidence)} units")
+        for s in SECTIONS:
+            print(f"\n--- {s}")
+            for q in res.queries[s]:
+                print(f"  query: {q.query!r} -> top: {q.final()[: cfg['retrieval']['top_k_per_query']]}")
+            for uid in res.sections[s]:
+                u = by_id[uid]
+                print(f"  [{uid}] ({u.unit_type}) {u.text}")
+        if res.truncated_by_total_cap:
+            print(f"\n  dropped by max_units_total: {res.truncated_by_total_cap}")
+        print(f"\n  evidence order: {res.evidence}")
+    trunc = {h: len(r.truncated_by_total_cap) for h, r in results.items()}
+    print(f"\nunits dropped by max_units_total per admission: {trunc}")
+    print(f"run: {run.path}")
+    run.finish(hadm_ids=ids, rerank=cfg["retrieval"]["rerank"],
+               dense_models=[cfg["retrieval"]["dense_query_model"], cfg["retrieval"]["dense_doc_model"]])
+    return 0
+
+
+def cmd_export_relevance(args: argparse.Namespace) -> int:
+    """Phase 3: export pooled top-10 per (admission, query) pair for manual labeling."""
+    from ehr_rag.config import SECTIONS
+    from ehr_rag.retrieval.relevance import POOL_DEPTH, POOLING_NOTE, sample_pairs, write_export
+    from ehr_rag.retrieval.retrieve import AdmissionRetriever, primary_dx, section_queries
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    seed = cfg["eval"]["seed"]
+    run = start_run(cfg, "export-relevance", command="export-relevance", seed=seed)
+    ids = _selected_ids(cfg)
+    units = _load_all_units(cfg, ids)
+    all_pairs = []
+    for h in ids:
+        qs = section_queries(cfg["retrieval"]["queries"], primary_dx(units[h]))
+        all_pairs.extend((h, q) for s in SECTIONS for q in qs[s])
+    all_pairs = sorted(set(all_pairs))
+    pairs = sample_pairs(all_pairs, cfg["retrieval"]["relevance_export_pairs"], seed)
+    enc = _encoders(cfg)
+    retrievers: dict = {}
+    items = []
+    for h, q in pairs:
+        if h not in retrievers:
+            retrievers[h] = AdmissionRetriever(units[h], enc, cfg["retrieval"]["rrf_k"])
+        r = retrievers[h].search(q)
+        rankings = {m: [d for d, _ in getattr(r, m)[:POOL_DEPTH]] for m in ("bm25", "dense", "fused")}
+        if r.reranked is not None:
+            rankings["reranked"] = [d for d, _ in r.reranked[:POOL_DEPTH]]
+        items.append({"hadm_id": h, "query": q, "rankings": rankings})
+    texts = {h: {u.unit_id: u.text for u in units[h]} for h in ids}
+    csv_path, side = write_export(run.path, items, texts)
+    n_rows = sum(1 for _ in csv_path.open(encoding="utf-8")) - 1
+    print(f"sampled {len(pairs)} of {len(all_pairs)} (admission, query) pairs with seed {seed}")
+    for h, q in pairs:
+        print(f"  {h}: {q}")
+    print(f"\nwrote {csv_path} ({n_rows} rows to label; fill 'relevant' with 0/1)\nwrote {side}")
+    print(POOLING_NOTE)
+    run.finish(pairs=[list(p) for p in pairs], n_rows=n_rows)
+    return 0
+
+
+def cmd_retrieval_metrics(args: argparse.Namespace) -> int:
+    """Phase 3: Recall@5 and MRR per method from a labeled relevance CSV."""
+    import json
+    from pathlib import Path
+
+    from ehr_rag.retrieval.relevance import compute_metrics, read_labels
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    labels_path = Path(args.labels)
+    rankings_path = Path(args.rankings) if args.rankings else labels_path.parent / "relevance_rankings.json"
+    rankings = json.loads(rankings_path.read_text(encoding="utf-8"))
+    metrics = compute_metrics(read_labels(labels_path), rankings)
+    run = start_run(cfg, "retrieval-metrics", command="retrieval-metrics")
+    run.write_json("retrieval_metrics.json", {**metrics, "labels": str(labels_path),
+                                              "rankings": str(rankings_path)})
+    print(f"{'method':<10} {'Recall@5':>9} {'MRR':>7} {'pairs':>6}")
+    for m, v in metrics["methods"].items():
+        print(f"{m:<10} {v['recall@5']:>9.3f} {v['mrr']:>7.3f} {v['n_pairs']:>6}")
+    if metrics["skipped_no_relevant"]:
+        print(f"skipped {len(metrics['skipped_no_relevant'])} pair(s) with no relevant unit in the pool")
+    print(metrics["note"])
+    run.finish()
+    print(f"run: {run.path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser with all subcommands."""
     parser = argparse.ArgumentParser(
@@ -193,6 +314,15 @@ def build_parser() -> argparse.ArgumentParser:
         "Phase 1: compute admission metrics, write candidates CSV and proposed selected_admissions.yaml.")
     add("build-units", cmd_build_units,
         "Phase 2: build evidence units and headers for admissions in config/selected_admissions.yaml.")
+    p = add("retrieve", cmd_retrieve, "Phase 3: per-section hybrid retrieval for the selected admissions.")
+    p.add_argument("--hadm-ids", nargs="*", help="restrict to these admissions (default: all selected)")
+    p.add_argument("--show", type=int, default=2, help="print sections for the first N admissions (default 2)")
+    add("export-relevance", cmd_export_relevance,
+        "Phase 3: write relevance_to_label.csv (pooled top-10 of BM25/dense/fused) for manual labeling.")
+    p = add("retrieval-metrics", cmd_retrieval_metrics,
+            "Phase 3: Recall@5 and MRR per method from a labeled relevance CSV (pooled relevance).")
+    p.add_argument("--labels", required=True, help="labeled relevance_to_label.csv")
+    p.add_argument("--rankings", help="relevance_rankings.json (default: next to --labels)")
     return parser
 
 
