@@ -9,8 +9,11 @@ Phases 0–3 only. After Phase 3's acceptance output, STOP. Do not start Phase 4
 ## Environment
 - Running on a Windows laptop, CPU only. No GPU.
 - Python virtual environment at `.venv/` (add `.venv/` to .gitignore).
-- Install the standard (CUDA-enabled) torch build, not a CPU-only build, so the same
-  requirements work on a GPU server later.
+- torch is pinned in requirements.txt; on Windows the PyPI wheel is CPU-only. On a GPU
+  server install torch from the CUDA index URL documented in requirements.txt/README first.
+  Use faiss-cpu everywhere.
+- Code must stay compatible with Python 3.10+; pinned versions must have wheels for
+  Python 3.11 and 3.12.
 - All paths come from config. Never hardcode laptop-specific paths.
 - Use pathlib for all file paths so code runs on both Windows and Linux.
 
