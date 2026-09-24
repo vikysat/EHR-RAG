@@ -1,0 +1,65 @@
+data:
+  source: demo                 # demo | full
+  root: data/mimic-iv-clinical-database-demo-2.2
+  derived: data/derived
+
+selection:
+  min_distinct_labs: 10
+  min_abnormal_labs: 3
+  min_distinct_drugs: 5
+  min_diagnoses: 3
+  n_admissions: 15
+
+units:
+  max_prior_admissions: 3
+  max_history_dx_per_admission: 5
+
+retrieval:
+  dense_query_model: ncbi/MedCPT-Query-Encoder
+  dense_doc_model: ncbi/MedCPT-Article-Encoder
+  rrf_k: 60
+  top_k_per_query: 5
+  max_units_per_section: 10
+  max_units_total: 30
+  rerank: false
+  rerank_model: ncbi/MedCPT-Cross-Encoder
+  relevance_export_pairs: 10
+  queries:
+    History:
+      - "past medical history and prior diagnoses"
+      - "chronic conditions related to {primary_dx}"
+    Findings:
+      - "abnormal laboratory results"
+      - "laboratory values related to {primary_dx}"
+      - "procedures performed during admission"
+    Impression:
+      - "primary diagnosis {primary_dx}"
+      - "secondary diagnoses and complications"
+    Recommendations:
+      - "medications administered"
+      - "treatment for {primary_dx}"
+
+generation:
+  backend: null                # anthropic | openai_compatible  (REQUIRED)
+  model: null                  # REQUIRED
+  base_url: null
+  api_key_env: null            # name of the environment variable holding the key
+  temperature: 0.0
+  max_tokens: 1500
+  prompt_version: report_v1
+  conditions: [no_retrieval, ehr_rag, full_context]
+  max_context_tokens: 12000
+  confirm_threshold: 20
+  endpoint_is_physionet_compliant: false
+
+eval:
+  nli_model: cross-encoder/nli-deberta-v3-base   # verify it loads; read id2label
+  manual_review_n: 100
+  seed: 13
+
+perturbation:
+  n_targets: 15
+  max_targets_per_admission: 2
+  edit_types: [lab_minor, lab_major, med_dose, delete]
+  n_controls: 3
+  seed: 13

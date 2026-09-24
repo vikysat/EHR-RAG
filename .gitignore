@@ -1,0 +1,15 @@
+# Anchored so that src/ehr_rag/data/ is NOT ignored.
+/data/
+/cache/
+/runs/
+.venv/
+.env
+*.faiss
+*.npy
+.hf_cache/
+hf_cache/
+/models/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
