@@ -220,8 +220,9 @@ def cmd_retrieve(args: argparse.Namespace) -> int:
     trunc = {h: len(r.truncated_by_total_cap) for h, r in results.items()}
     print(f"\nunits dropped by max_units_total per admission: {trunc}")
     print(f"run: {run.path}")
-    run.finish(hadm_ids=ids, rerank=cfg["retrieval"]["rerank"],
-               dense_models=[cfg["retrieval"]["dense_query_model"], cfg["retrieval"]["dense_doc_model"]])
+    revs = enc.revisions()
+    print(f"model revisions: {revs}")
+    run.finish(hadm_ids=ids, rerank=cfg["retrieval"]["rerank"], model_revisions=revs)
     return 0
 
 
@@ -262,7 +263,9 @@ def cmd_export_relevance(args: argparse.Namespace) -> int:
         print(f"  {h}: {q}")
     print(f"\nwrote {csv_path} ({n_rows} rows to label; fill 'relevant' with 0/1)\nwrote {side}")
     print(POOLING_NOTE)
-    run.finish(pairs=[list(p) for p in pairs], n_rows=n_rows)
+    revs = enc.revisions()
+    print(f"model revisions: {revs}")
+    run.finish(pairs=[list(p) for p in pairs], n_rows=n_rows, model_revisions=revs)
     return 0
 
 

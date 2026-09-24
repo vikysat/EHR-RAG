@@ -145,3 +145,13 @@ def test_rerank_path_and_lazy_model(fake_config: Path) -> None:
     scores = [s for _, s in res.reranked]
     assert scores == sorted(scores, reverse=True)
     assert {d for d, _ in res.reranked} == {u.unit_id for u in us}
+
+
+def test_commit_hash_required() -> None:
+    from types import SimpleNamespace
+
+    from ehr_rag.retrieval.dense import _commit_hash
+
+    assert _commit_hash(SimpleNamespace(config=SimpleNamespace(_commit_hash="abc123")), "m") == "abc123"
+    with pytest.raises(RuntimeError, match="revision hash"):
+        _commit_hash(SimpleNamespace(config=SimpleNamespace()), "m")

@@ -12,7 +12,7 @@ from ehr_rag.data.select_admissions import apply_selection, compute_metrics
 def test_lab_linkage_counts(fake_config: Path) -> None:
     t = load_tables(load_config(fake_config))
     s = t.lab_link_stats
-    assert s["linked_by_hadm_id"] == 6
+    assert s["linked_by_hadm_id"] == 7
     assert s["linked_by_time_window"] == 1
     tw = t["labevents"][t["labevents"]["linked_by"] == "time_window"]
     assert tw["labevent_id"].tolist() == [4] and tw["link_hadm_id"].tolist() == [12]

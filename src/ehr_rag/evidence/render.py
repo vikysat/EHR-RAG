@@ -5,8 +5,9 @@ side effects and depends only on its arguments. Abnormality markers are
 computed here from the values and reference range in ``fields``; they are
 never stored in fields or text elsewhere.
 
-Marker rule for a numeric lab value: if the unit has at least one reference
-bound, ``[HIGH]`` when value > ref_high, ``[LOW]`` when value < ref_low. If the
+Marker rule for a numeric lab value: a 0–0 reference range is treated as no
+range (``fields`` keep the original strings; the rule is applied here). If the
+unit has at least one reference bound, ``[HIGH]`` when value > ref_high, ``[LOW]`` when value < ref_low. If the
 unit has no reference bound, ``[ABNORMAL]`` when that measurement's ``flag``
 field is ``"abnormal"`` (MIMIC's flag carries no direction). Otherwise no marker.
 """
@@ -28,8 +29,16 @@ def _fmt_date(iso: str | None) -> str:
     return iso[:10] if iso else "unknown date"
 
 
+def effective_ref(ref_low: str | None, ref_high: str | None) -> tuple[str | None, str | None]:
+    """Reference range actually used. A 0–0 range (MIMIC placeholder) counts as no range."""
+    if ref_low is not None and ref_high is not None and float(ref_low) == 0 and float(ref_high) == 0:
+        return None, None
+    return ref_low, ref_high
+
+
 def lab_marker(value: str, flag: str | None, ref_low: str | None, ref_high: str | None) -> str:
     """Marker for one lab value: '[HIGH]', '[LOW]', '[ABNORMAL]' or ''."""
+    ref_low, ref_high = effective_ref(ref_low, ref_high)
     if ref_low is not None or ref_high is not None:
         v = float(value)
         if ref_high is not None and v > float(ref_high):
@@ -59,7 +68,7 @@ def _lab_head(f: dict[str, Any]) -> str:
     parts = [head]
     if f.get("uom"):
         parts.append(f["uom"])
-    ref = _ref_text(f.get("ref_low"), f.get("ref_high"))
+    ref = _ref_text(*effective_ref(f.get("ref_low"), f.get("ref_high")))
     if ref:
         parts.append(ref)
     return ", ".join(parts)

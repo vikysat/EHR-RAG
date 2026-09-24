@@ -29,14 +29,14 @@ retrieval:
       - "past medical history and prior diagnoses"
       - "chronic conditions related to {primary_dx}"
     Findings:
-      - "abnormal laboratory results"
-      - "laboratory values related to {primary_dx}"
+      - "laboratory results high low"
+      - "blood test values {primary_dx}"
       - "procedures performed during admission"
     Impression:
       - "primary diagnosis {primary_dx}"
       - "secondary diagnoses and complications"
     Recommendations:
-      - "medications administered"
+      - "medications drugs dose route administered"
       - "treatment for {primary_dx}"
 
 generation:

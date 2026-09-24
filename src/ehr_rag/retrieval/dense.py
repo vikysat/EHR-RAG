@@ -35,6 +35,14 @@ def cache_key(model_name: str, title: str, text: str) -> str:
     return h.hexdigest()
 
 
+def _commit_hash(model: object, model_name: str) -> str:
+    """Resolved Hugging Face commit hash of a loaded model; raises if unavailable."""
+    h = getattr(getattr(model, "config", None), "_commit_hash", None)
+    if not h:
+        raise RuntimeError(f"could not resolve the Hugging Face revision hash for {model_name}")
+    return str(h)
+
+
 class EmbeddingCache:
     """A simple npz-backed ``key -> vector`` store for one model."""
 
@@ -88,6 +96,11 @@ class MedCPTEncoder:
         self._tok = AutoTokenizer.from_pretrained(self.model_name)
         self._model = AutoModel.from_pretrained(self.model_name)
         self._model.eval()
+
+    def revision(self) -> str:
+        """Resolved Hugging Face commit hash (loads the model if needed)."""
+        self._load()
+        return _commit_hash(self._model, self.model_name)
 
     def _encode_batch(self, items: list[tuple[str, str]] | list[str]) -> np.ndarray:
         import torch
@@ -157,6 +170,11 @@ class MedCPTCrossEncoder:
         self._tok = AutoTokenizer.from_pretrained(self.model_name)
         self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
         self._model.eval()
+
+    def revision(self) -> str:
+        """Resolved Hugging Face commit hash (loads the model if needed)."""
+        self._load()
+        return _commit_hash(self._model, self.model_name)
 
     def score(self, query: str, texts: list[str]) -> list[float]:
         """Relevance logits for (query, text) pairs, following the model card."""

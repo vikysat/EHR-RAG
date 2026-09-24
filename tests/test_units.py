@@ -105,3 +105,34 @@ def test_header(fake_config: Path) -> None:
     h = build_header(load_tables(load_config(fake_config)), 12)
     assert h["age"] == 50 and h["gender"] == "F" and h["admission_type"] == "EW EMER."
     assert h["admittime"] == "2100-02-01T08:00:00" and h["los_days"] == 5.04
+
+
+def test_zero_zero_range_falls_back_to_flag() -> None:
+    f = {"label": "Fakeocytes", "fluid": "Blood", "uom": "%", "ref_low": "0", "ref_high": "0",
+         "numeric": True, "n_measurements": 1,
+         "first": {"value": "21", "time": "2100-01-01T00:00:00", "flag": None}}
+    text = render("lab", f)
+    assert "ref" not in text and "[" not in text  # no range shown, no [HIGH]
+    f["first"]["flag"] = "abnormal"
+    assert "21 [ABNORMAL]" in render("lab", f)
+
+
+def test_zero_zero_range_in_selection_mask() -> None:
+    import pandas as pd
+
+    from ehr_rag.data.select_admissions import lab_abnormal_mask
+
+    labs = pd.DataFrame({
+        "valuenum_f": [21.0, 21.0, 6.0],
+        "ref_range_lower_f": [0.0, 0.0, 3.3],
+        "ref_range_upper_f": [0.0, 0.0, 5.1],
+        "flag": [None, "abnormal", None],
+    })
+    assert lab_abnormal_mask(labs).tolist() == [False, True, True]
+
+
+def test_masked_text_lab_dropped(fake_config: Path) -> None:
+    cfg = load_config(fake_config)
+    units, drop = build_units_for_admission(load_tables(cfg), 21, cfg["units"])
+    assert not any(u.unit_type == "lab" and u.fields["label"] == "Fake Masked" for u in units)
+    assert any(d["reason"] == "text-only lab whose last value is the ___ mask" for d in drop)

@@ -38,11 +38,13 @@ FAKE_TABLES: dict[str, list[list[Any]]] = {
         [5, 1, 12, 901, "2100-02-02 10:00:00", "POSITIVE", "", "", "", "", "abnormal"],
         [6, 2, 21, 900, "2100-03-01 09:00:00", "2.9", "2.9", "mmol/L", "3.3", "5.1", "abnormal"],
         [7, 1, 11, 900, "2100-01-02 09:00:00", "4.0", "4.0", "mmol/L", "3.3", "5.1", ""],
+        [8, 2, 21, 902, "2100-03-01 10:00:00", "___", "", "", "", "", ""],
     ],
     "d_labitems": [
         ["itemid", "label", "fluid", "category"],
         [900, "Fakeium", "Blood", "Chemistry"],
         [901, "Fake Screen", "Urine", "Urinalysis"],
+        [902, "Fake Masked", "Blood", "Chemistry"],
     ],
     "prescriptions": [
         ["subject_id", "hadm_id", "pharmacy_id", "starttime", "stoptime", "drug", "dose_val_rx",

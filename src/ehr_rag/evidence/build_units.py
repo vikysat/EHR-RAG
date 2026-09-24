@@ -24,6 +24,7 @@ from ehr_rag.evidence.render import lab_marker, render
 from ehr_rag.evidence.schema import UNIT_TYPES, EvidenceUnit, write_units
 
 TYPE_ORDER: dict[str, int] = {t: i for i, t in enumerate(UNIT_TYPES)}
+DEID_MASK = "___"  # MIMIC de-identification mask
 
 
 def _iso(ts: Any) -> str | None:
@@ -151,6 +152,10 @@ def _lab_units(tables: Tables, hadm_id: int, drop: list[dict[str, Any]]) -> list
                              "detail": f"itemid={itemid} {base['label']}", "n_rows": len(g)})
                 continue
             last = g_val.iloc[-1]
+            if str(last["value"]).strip() == DEID_MASK:
+                drop.append({"unit_type": "lab", "reason": "text-only lab whose last value is the ___ mask",
+                             "detail": f"itemid={itemid} {base['label']}", "n_rows": len(g_val)})
+                continue
             uom, _ = _mode([_s(u) for u in g_val["valueuom"]])
             fields = {
                 **base, "numeric": False, "uom": uom, "ref_low": None, "ref_high": None,

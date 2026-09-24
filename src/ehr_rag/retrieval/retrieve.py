@@ -69,6 +69,13 @@ class Encoders:
             cross=cross,
         )
 
+    def revisions(self) -> dict[str, str]:
+        """Model name -> resolved Hugging Face commit hash, for every model in use."""
+        out = {self.query.model_name: self.query.revision(), self.doc.model_name: self.doc.revision()}
+        if self.cross is not None:
+            out[self.cross.model_name] = self.cross.revision()
+        return out
+
 
 @dataclass
 class QueryResult:

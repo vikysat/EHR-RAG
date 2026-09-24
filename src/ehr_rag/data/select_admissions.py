@@ -5,7 +5,8 @@ Definitions (as implemented):
 - ``n_distinct_labs``: distinct ``itemid`` among lab rows linked to the admission
   (by hadm_id or by time window, see ``load.link_labs``).
 - ``n_abnormal_labs``: number of linked lab result rows that are abnormal. A row
-  is abnormal if it has a numeric value and at least one reference bound, and
+  is abnormal if it has a numeric value and at least one reference bound (a
+  0–0 range counts as no range), and
   the value is below the lower or above the upper bound; if the row has no
   reference bound (or no numeric value), it is abnormal iff ``flag == "abnormal"``.
 - ``n_distinct_drugs``: distinct non-null ``drug`` names (case-insensitive,
@@ -37,8 +38,9 @@ from ehr_rag.data.load import Tables
 def lab_abnormal_mask(labs: pd.DataFrame) -> pd.Series:
     """Boolean mask of abnormal lab rows (see module docstring)."""
     v = labs["valuenum_f"]
-    lo = labs["ref_range_lower_f"]
-    hi = labs["ref_range_upper_f"]
+    zero_zero = (labs["ref_range_lower_f"] == 0) & (labs["ref_range_upper_f"] == 0)
+    lo = labs["ref_range_lower_f"].mask(zero_zero)
+    hi = labs["ref_range_upper_f"].mask(zero_zero)
     has_ref = lo.notna() | hi.notna()
     numeric_cmp = v.notna() & has_ref
     out_of_range = (lo.notna() & (v < lo)) | (hi.notna() & (v > hi))
