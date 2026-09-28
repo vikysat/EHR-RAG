@@ -1,0 +1,16 @@
+Draft a clinical report for one hospital admission using ONLY the patient header and the evidence below.
+
+Rules:
+1. Output exactly four section header lines, in this order: ### History, ### Findings, ### Impression, ### Recommendations
+2. Under each header, write one sentence per line. No bullets, no numbering, no blank lines inside a section.
+3. Every sentence ends with citations in the form [E3] or [E3, E7], using only IDs from the evidence block. Cite every evidence unit the sentence relies on.
+4. Do not state patient-specific facts that are not in the evidence. If the evidence for a section is insufficient, write the single line: Insufficient evidence. [NONE]
+5. Impression and Recommendations may contain clinical reasoning, but every sentence must cite the evidence units the reasoning is based on.
+6. The patient header is context only and cannot be cited.
+7. Output only the report: no title, preamble or closing remarks.
+
+Patient header:
+{header}
+
+Evidence (one unit per line: [ID] (type) text):
+{evidence}

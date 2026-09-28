@@ -23,9 +23,10 @@ import yaml
 from ehr_rag.config import project_root, public_config
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_RUN_ID_RE = re.compile(r"^\d{8}-\d{6}-[A-Za-z0-9_.-]+$")
 _TRACKED_PACKAGES = (
     "numpy", "pandas", "pyyaml", "rank_bm25", "faiss-cpu", "torch",
-    "transformers", "sentence-transformers",
+    "transformers", "sentence-transformers", "accelerate", "anthropic", "openai",
 )
 
 
@@ -86,20 +87,34 @@ class Run:
         self.write_json("run_meta.json", self.meta)
 
 
-def start_run(cfg: dict[str, Any], name: str, command: str, seed: int | None = None) -> Run:
+def start_run(
+    cfg: dict[str, Any], name: str, command: str, seed: int | None = None, run_id: str | None = None
+) -> Run:
     """Create ``runs/<run_id>/`` and write the config snapshot and metadata.
 
     If a directory with the same id already exists (two runs of the same name
     within one second), a numeric suffix ``-2``, ``-3``... is appended.
+
+    An explicit ``run_id`` (``YYYYMMDD-HHMMSS-<name>``, e.g. chosen by an sbatch
+    script) may name a directory that already exists, as long as no run has been
+    started in it (no ``run_meta.json``); the script may have written logs there.
     """
     runs_dir = project_root(cfg) / "runs"
-    base = make_run_id(name)
-    run_id, i = base, 1
-    while (runs_dir / run_id).exists():
-        i += 1
-        run_id = f"{base}-{i}"
-    path = runs_dir / run_id
-    path.mkdir(parents=True)
+    if run_id is not None:
+        if not _RUN_ID_RE.match(run_id):
+            raise ValueError(f"run id must match {_RUN_ID_RE.pattern}, got {run_id!r}")
+        path = runs_dir / run_id
+        if (path / "run_meta.json").exists():
+            raise ValueError(f"run {run_id} already exists: {path}")
+        path.mkdir(parents=True, exist_ok=True)
+    else:
+        base = make_run_id(name)
+        run_id, i = base, 1
+        while (runs_dir / run_id).exists():
+            i += 1
+            run_id = f"{base}-{i}"
+        path = runs_dir / run_id
+        path.mkdir(parents=True)
     with (path / "config.yaml").open("w", encoding="utf-8") as f:
         yaml.safe_dump(public_config(cfg), f, sort_keys=False, allow_unicode=True)
     meta: dict[str, Any] = {

@@ -214,3 +214,18 @@ def retrieve_admission(
         hadm_id=retriever.hadm_id, primary_dx=pdx, queries=results, sections=sections,
         evidence=evidence, truncated_by_total_cap=dropped,
     )
+
+
+def evidence_record(res: AdmissionRetrieval, units: list[EvidenceUnit]) -> dict[str, Any]:
+    """``res.to_json()`` plus ``evidence_units``: the ordered evidence with type and text.
+
+    Saved per admission by the ``retrieve`` command; generation reuses it verbatim
+    (and checks it still matches the current unit files).
+    """
+    by_id = {u.unit_id: u for u in units}
+    return {
+        **res.to_json(),
+        "evidence_units": [
+            {"unit_id": d, "unit_type": by_id[d].unit_type, "text": by_id[d].text} for d in res.evidence
+        ],
+    }

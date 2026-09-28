@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from ehr_rag.config import load_config
@@ -17,21 +15,7 @@ from ehr_rag.retrieval.bm25 import tokenize
 from ehr_rag.retrieval.fuse import rrf
 from ehr_rag.retrieval.relevance import compute_metrics, read_labels, sample_pairs, write_export
 from ehr_rag.retrieval.retrieve import AdmissionRetriever, Encoders, interleave, retrieve_admission
-
-
-class FakeEncoder:
-    """Deterministic bag-of-hashed-tokens encoder standing in for MedCPT in tests."""
-
-    dim = 64
-
-    def encode(self, items: list) -> np.ndarray:
-        out = np.zeros((len(items), self.dim), dtype=np.float32)
-        for i, it in enumerate(items):
-            text = it if isinstance(it, str) else f"{it[0]} {it[1]}"
-            for tok in tokenize(text):
-                out[i, int(hashlib.md5(tok.encode()).hexdigest(), 16) % self.dim] += 1.0
-        out += 1e-6
-        return out / np.linalg.norm(out, axis=1, keepdims=True)
+from fakes import FakeEncoder
 
 
 def _fake_encoders() -> Encoders:

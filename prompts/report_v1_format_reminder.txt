@@ -1,0 +1,4 @@
+FORMAT REMINDER: a previous answer to this request did not follow the required output format. Problems found:
+{problems}
+
+Write the complete report and follow every rule above exactly. Output only the report.

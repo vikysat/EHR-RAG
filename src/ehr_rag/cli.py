@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from typing import TYPE_CHECKING, Callable
 
@@ -189,7 +190,7 @@ def _encoders(cfg: dict) -> "object":
 def cmd_retrieve(args: argparse.Namespace) -> int:
     """Phase 3: run section retrieval for all selected admissions."""
     from ehr_rag.config import SECTIONS
-    from ehr_rag.retrieval.retrieve import retrieve_admission
+    from ehr_rag.retrieval.retrieve import evidence_record, retrieve_admission
     from ehr_rag.runs import start_run
 
     cfg = load_config(args.config)
@@ -200,7 +201,7 @@ def cmd_retrieve(args: argparse.Namespace) -> int:
     results = {}
     for h in ids:
         res = retrieve_admission(units[h], enc, cfg["retrieval"])
-        run.write_json(f"retrieval/{h}.json", res.to_json())
+        run.write_json(f"retrieval/{h}.json", evidence_record(res, units[h]))
         results[h] = res
     for h in ids[: args.show]:
         res = results[h]
@@ -296,6 +297,88 @@ def cmd_retrieval_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def _target_ids(cfg: dict, args: argparse.Namespace) -> list[int]:
+    ids = [int(h) for h in args.hadm_ids] if args.hadm_ids else _selected_ids(cfg)
+    if args.limit is not None:
+        ids = ids[: args.limit]
+    if not ids:
+        raise ConfigError("no admissions selected")
+    return ids
+
+
+def cmd_generate(args: argparse.Namespace) -> int:
+    """Phase 4: generate reports for the configured conditions."""
+    from ehr_rag.config import CONDITIONS, validate_for_generation
+    from ehr_rag.generation.backends import BackendError, gpu_name, make_backend
+    from ehr_rag.generation.generate import ConfirmationRequired, GenerationError, run_generation
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    validate_for_generation(cfg)
+    gen = cfg["generation"]
+    conditions = args.conditions or list(gen["conditions"])
+    bad = [c for c in conditions if c not in CONDITIONS]
+    if bad:
+        raise ConfigError(f"unknown condition(s) {bad}; allowed {list(CONDITIONS)}")
+    ids = _target_ids(cfg, args)
+    run = start_run(cfg, "generate", command="generate", run_id=args.run_id)
+    run.meta.update(backend=gen["backend"], model=gen["model"], conditions=conditions, hadm_ids=ids,
+                    retrieval_run=args.retrieval_run, prompt_version=gen["prompt_version"],
+                    gpu_name=gpu_name(), hf_hub_offline=os.environ.get("HF_HUB_OFFLINE"))
+    run.write_json("run_meta.json", run.meta)
+    print(f"run: {run.path}")
+    try:
+        backend = make_backend(gen)
+        summary = run_generation(cfg, run, backend, hadm_ids=ids, conditions=conditions,
+                                 retrieval_run=args.retrieval_run, yes=args.yes, no_cache=args.no_cache)
+    except ConfirmationRequired as e:
+        print(f"NOT RUN: {e}")
+        run.finish(status="not_confirmed")
+        return 5
+    except (BackendError, GenerationError, OSError, ValueError) as e:
+        print(f"STOP - generation failed: {e}", file=sys.stderr)
+        run.finish(status="failed", error=repr(e))
+        return 4
+    except BaseException as e:
+        run.finish(status="failed", error=repr(e))
+        raise
+    print("\n== Format status per condition")
+    print(f"{'condition':<14} {'ok':>4} {'retry_ok':>9} {'format_error':>13} {'skipped':>8}")
+    for c, n in summary["counts"].items():
+        print(f"{c:<14} {n['ok']:>4} {n['ok_after_retry']:>9} {n['format_error']:>13} {n['skipped']:>8}")
+    print(f"\nmodel calls: {summary['n_api_calls']}; cache hits: {summary['n_cache_hits']}; "
+          f"reported model id(s): {summary['reported_models']}; revision: {summary['model_revision']}")
+    run.finish(model_revision=summary["model_revision"], reported_model_ids=summary["reported_models"],
+               format_counts=summary["counts"], n_api_calls=summary["n_api_calls"],
+               n_cache_hits=summary["n_cache_hits"], skipped_full_context=summary["skipped"])
+    print(f"run: {run.path}")
+    return 0
+
+
+def cmd_context_tokens(args: argparse.Namespace) -> int:
+    """Phase 4: templated full_context prompt tokens per admission vs max_context_tokens."""
+    from ehr_rag.config import validate_for_generation
+    from ehr_rag.generation.backends import BackendError, make_backend
+    from ehr_rag.generation.generate import context_token_counts
+
+    import pandas as pd
+
+    cfg = load_config(args.config)
+    validate_for_generation(cfg)
+    ids = _target_ids(cfg, args)
+    try:
+        rows = context_token_counts(cfg, make_backend(cfg["generation"]), ids)
+    except (BackendError, OSError) as e:
+        print(f"STOP - could not count tokens: {e}", file=sys.stderr)
+        return 4
+    _print_table(pd.DataFrame(rows))
+    limit = cfg["generation"]["max_context_tokens"]
+    how = "exact, model tokenizer" if all(r["tokens_exact"] for r in rows) else "approximate, chars/4"
+    print(f"\n{sum(r['fits'] for r in rows)}/{len(rows)} admissions fit max_context_tokens = {limit:,} "
+          f"(whole templated prompt; {how})")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser with all subcommands."""
     parser = argparse.ArgumentParser(
@@ -326,6 +409,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Phase 3: Recall@5 and MRR per method from a labeled relevance CSV (pooled relevance).")
     p.add_argument("--labels", required=True, help="labeled relevance_to_label.csv")
     p.add_argument("--rankings", help="relevance_rankings.json (default: next to --labels)")
+    p = add("generate", cmd_generate, "Phase 4: generate reports per condition for the selected admissions.")
+    p.add_argument("--conditions", nargs="+", help="subset of generation.conditions (default: all configured)")
+    p.add_argument("--limit", type=int, help="only the first N selected admissions")
+    p.add_argument("--hadm-ids", nargs="*", help="restrict to these admissions (default: all selected)")
+    p.add_argument("--retrieval-run", help="run id of a saved `retrieve` run (required for ehr_rag)")
+    p.add_argument("--yes", action="store_true", help="confirm when new calls exceed generation.confirm_threshold")
+    p.add_argument("--no-cache", action="store_true", help="bypass the response cache (fresh calls)")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name> (used by scripts/generate.sbatch)")
+    p = add("context-tokens", cmd_context_tokens,
+            "Phase 4: print full_context templated-prompt tokens per admission vs max_context_tokens.")
+    p.add_argument("--limit", type=int, help="only the first N selected admissions")
+    p.add_argument("--hadm-ids", nargs="*", help="restrict to these admissions (default: all selected)")
     return parser
 
 

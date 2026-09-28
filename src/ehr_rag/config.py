@@ -15,7 +15,9 @@ from typing import Any
 import yaml
 
 SECTIONS: tuple[str, ...] = ("History", "Findings", "Impression", "Recommendations")
-BACKENDS: tuple[str, ...] = ("anthropic", "openai_compatible")
+BACKENDS: tuple[str, ...] = ("anthropic", "openai_compatible", "hf_local")
+API_BACKENDS: tuple[str, ...] = ("anthropic", "openai_compatible")
+_LOCAL_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
 CONDITIONS: tuple[str, ...] = ("no_retrieval", "ehr_rag", "full_context")
 EDIT_TYPES: tuple[str, ...] = ("lab_minor", "lab_major", "med_dose", "delete")
 
@@ -141,14 +143,54 @@ def validate_config(cfg: dict[str, Any]) -> None:
 
 
 def validate_for_generation(cfg: dict[str, Any]) -> None:
-    """Checks that must pass before any generation run. Raises ConfigError."""
+    """Checks that must pass before any generation run. Raises ConfigError.
+
+    The API-key check applies only to API backends; ``hf_local`` needs no key but
+    requires temperature 0 (it always decodes greedily).
+    """
     gen = cfg["generation"]
     if not gen["model"]:
         raise ConfigError("generation.model is not set; it has no default. Set it in the config.")
     if not gen["backend"]:
-        raise ConfigError("generation.backend is not set; choose 'anthropic' or 'openai_compatible'.")
-    if not gen["api_key_env"]:
+        raise ConfigError(f"generation.backend is not set; choose one of {list(BACKENDS)}.")
+    if gen["backend"] in API_BACKENDS and not gen["api_key_env"]:
         raise ConfigError("generation.api_key_env is not set; name the environment variable holding the API key.")
+    if gen["backend"] == "hf_local" and gen["temperature"] != 0:
+        raise ConfigError("generation.temperature must be 0 for hf_local (greedy decoding only).")
+    check_compliance(cfg)
+
+
+def backend_is_external(gen: dict[str, Any]) -> bool:
+    """True if the configured backend sends data off this machine.
+
+    ``anthropic`` is always external; ``openai_compatible`` is external unless
+    ``base_url`` points at localhost; ``hf_local`` runs in-process.
+    """
+    backend = gen["backend"]
+    if backend == "hf_local":
+        return False
+    if backend == "openai_compatible" and gen["base_url"]:
+        from urllib.parse import urlparse
+
+        return urlparse(gen["base_url"]).hostname not in _LOCAL_HOSTS
+    return True
+
+
+COMPLIANCE_WARNING = (
+    "WARNING: data.source is 'full' (credentialed MIMIC-IV). Credentialed data may only be sent "
+    "to services permitted under the PhysioNet data use agreement."
+)
+
+
+def check_compliance(cfg: dict[str, Any]) -> None:
+    """SPEC section 5: refuse full data + external endpoint unless declared compliant."""
+    if cfg["data"]["source"] != "full" or not backend_is_external(cfg["generation"]):
+        return
+    if not cfg["generation"]["endpoint_is_physionet_compliant"]:
+        raise ConfigError(
+            COMPLIANCE_WARNING + " Refusing to run: generation.endpoint_is_physionet_compliant is false."
+        )
+    print(COMPLIANCE_WARNING)
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
