@@ -2,13 +2,16 @@
 
 - ``FakeEncoder``: deterministic bag-of-hashed-tokens encoder standing in for MedCPT.
 - ``FakeBackend``: generation backend returning canned reports (well-formed and malformed).
+- ``realistic_report``: a FAKE report that restates values from the evidence block (so
+  perturbation outcomes can be exercised end to end).
+- ``FakeNLI``: rule-based stand-in for the NLI model.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -99,3 +102,69 @@ class FakeBackend:
             text=text, model=f"{self.model}-reported", revision="fake-revision", input_tokens=len(prompt.split()),
             output_tokens=len(text.split()), finish_reason="stop", temperature_applied=True,
         )
+
+
+_EVIDENCE_LINE_RE = re.compile(r"^\[(E\d+)\] \((\w+)\) (.*)$", re.MULTILINE)
+_LAB_VALUE_RE = re.compile(r"(?:max|Value) (-?\d+(?:\.\d+)?)")
+
+
+def realistic_report(prompt: str) -> str:
+    """A well-formed FAKE report restating lab values and doses from the evidence block."""
+    ev = _EVIDENCE_LINE_RE.findall(prompt)
+    if not ev:
+        return NONE_REPORT
+    hist, find, imp, rec = [], [], [], []
+    for uid, typ, text in ev:
+        if typ in ("diagnosis", "history_diagnosis") and ": " in text:
+            title = text.split(": ", 1)[1].split(" (ICD")[0]
+            (hist if typ == "history_diagnosis" else imp).append(f"The patient has {title}. [{uid}]")
+        elif typ == "lab":
+            m = _LAB_VALUE_RE.search(text)
+            if m:
+                label = re.split(r" \(|,", text, maxsplit=1)[0]
+                find.append(f"{label} reached {m.group(1)}. [{uid}]")
+        elif typ == "medication":
+            rec.append(f"Continue {text.split(', ordered')[0]}. [{uid}]")
+    none = ["Insufficient evidence. [NONE]"]
+    out = []
+    for name, lines in (("History", hist), ("Findings", find), ("Impression", imp), ("Recommendations", rec)):
+        out.append(f"### {name}")
+        out.extend(lines[:3] or none)
+    return "\n".join(out) + "\n"
+
+
+def realistic_responder(prompt: str, n: int) -> str:
+    """FakeBackend responder built on ``realistic_report``."""
+    return realistic_report(prompt)
+
+
+_NUM_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)?")
+
+
+class FakeNLI:
+    """Rule-based FAKE verifier: entailment iff the hypothesis has numbers and all appear in the premise,
+    or (without numbers) all its words of >= 5 letters appear in the premise. Otherwise neutral."""
+
+    model_name = "fake-nli"
+    entailment_label = "entailment"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    @staticmethod
+    def rule(premise: str, hyp: str) -> str:
+        nums = _NUM_RE.findall(hyp)
+        if nums:
+            ok = all(n in _NUM_RE.findall(premise) for n in nums)
+        else:
+            words = [w for w in re.findall(r"[a-z]+", hyp.lower()) if len(w) >= 5]
+            ok = bool(words) and all(w in premise.lower() for w in words)
+        return "entailment" if ok else "neutral"
+
+    def labels(self, pairs: list[tuple[str, str]]) -> list[str]:
+        self.calls.extend(pairs)
+        return [self.rule(p, h) for p, h in pairs]
+
+    def info(self) -> dict[str, Any]:
+        return {"model": self.model_name, "revision": "fake", "id2label": {0: "entailment", 1: "neutral"},
+                "entailment_label": "entailment", "n_truncated_pairs": 0}

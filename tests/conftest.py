@@ -13,6 +13,8 @@ from typing import Any
 import pytest
 import yaml
 
+HADM = [12, 21]
+
 REPO = Path(__file__).resolve().parents[1]
 
 FAKE_TABLES: dict[str, list[list[Any]]] = {
@@ -93,3 +95,33 @@ def fake_config(tmp_path: Path) -> Path:
     p = tmp_path / "config" / "test.yaml"
     p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
     return p
+
+
+@pytest.fixture()
+def env(fake_config: Path) -> dict[str, Any]:
+    """Fake units + headers on disk, the real prompts copied in, and a saved retrieve run."""
+    from ehr_rag.config import load_config
+    from ehr_rag.data.load import load_tables
+    from ehr_rag.evidence.build_units import build_all, units_dir
+    from ehr_rag.evidence.schema import read_units
+    from ehr_rag.retrieval.retrieve import Encoders, evidence_record, retrieve_admission
+    from ehr_rag.runs import start_run
+    from fakes import FakeEncoder
+
+    cfg = load_config(fake_config)
+    root = Path(cfg["_project_root"])
+    (root / "prompts").mkdir()
+    for p in (REPO / "prompts").glob("report_v1*.txt"):
+        (root / "prompts" / p.name).write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+    out = units_dir(Path(cfg["data"]["derived"]))
+    build_all(load_tables(cfg), HADM, cfg["units"], out)
+    units = {h: read_units(out / f"{h}.jsonl") for h in HADM}
+    enc = Encoders(query=FakeEncoder(), doc=FakeEncoder(), cross=None)  # type: ignore[arg-type]
+    rrun = start_run(cfg, "retrieve", command="retrieve")
+    evidence = {}
+    for h in HADM:
+        res = retrieve_admission(units[h], enc, cfg["retrieval"])
+        rrun.write_json(f"retrieval/{h}.json", evidence_record(res, units[h]))
+        evidence[h] = res.evidence
+    return {"cfg": cfg, "root": root, "units": units, "evidence": evidence, "retrieval_run": rrun.run_id,
+            "units_dir": out}

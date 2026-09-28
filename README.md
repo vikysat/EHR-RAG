@@ -78,3 +78,57 @@ sbatch scripts/generate.sbatch --retrieval-run <retrieve_run_id> --yes          
 
 The job writes `nvidia-smi.txt`, `slurm_env.txt`, `stdout.log` and `stderr.log` into the
 run folder; SLURM's own log goes to `runs/slurm-<jobid>.out`.
+
+### Phase 5: evaluation
+
+```bash
+python -m ehr_rag.cli evaluate --generation-run <generate_run_id>        # or: sbatch scripts/cli.sbatch evaluate ...
+python -m ehr_rag.cli verifier-agreement --labels runs/<evaluate_run_id>/manual_review.csv   # after you label it
+python -m ehr_rag.cli text-metrics --generation-run <id> --references refs.csv  # exits: the Demo has no references
+```
+
+## Metric definitions (as implemented)
+
+Parsing (`eval/parse.py`): sections are split on the exact lines `### History`,
+`### Findings`, `### Impression`, `### Recommendations`; every other non-blank line
+in a section is one sentence. Only the trailing citation group counts (`[E3]`,
+`[E3, E7]`, `[E3][E7]`, `[NONE]`); ids are de-duplicated per sentence. Citations
+elsewhere in a line are flagged `mid_sentence_citation` and ignored; lines with a
+sentence boundary (`.`/`!`/`?` + space + capital letter) are flagged
+`multiple_sentences`. Missing, duplicate, extra and out-of-order sections and text
+before the first header are flagged per report.
+
+Metrics (`eval/citations.py`) use every sentence of the four sections except
+abstention lines `Insufficient evidence. [NONE]` (reported as `n_abstentions`).
+A citation is *valid* if its id is in the report's `evidence_shown.json`.
+
+- `cited_rate`: sentences with at least one valid citation / sentences.
+- `invalid_citation_rate`: E-id citations not in `evidence_shown.json` / all E-id
+  citations (`[NONE]` is not a citation).
+- `citation_recall` (ALCE, Gao et al. 2023): a sentence is supported iff it has at
+  least one valid citation and NLI(premise = texts of its valid cited units joined by
+  a space in citation order, hypothesis = sentence) is `entailment`. Recall =
+  supported / sentences.
+- `citation_precision` (ALCE): a valid citation c of a sentence with valid set C is
+  irrelevant iff NLI(c alone) is not entailment AND entail(C − {c}) == entail(C),
+  with entail(∅) = false. Invalid ids are irrelevant. Precision = relevant citations /
+  all E-id citations.
+- Aggregates are micro-averages per condition, per section, and for History+Findings
+  vs Impression+Recommendations (entailment is less meaningful for the inferential
+  sections). A zero denominator gives n/a.
+- NLI model `eval.nli_model` (default `cross-encoder/nli-deberta-v3-base`); the label
+  order comes from the model's `config.id2label`. Pairs longer than 512 tokens are
+  truncated from the premise only and counted (`n_truncated_pairs` in `metrics.json`).
+- Reports that ended in `format_error` are included (best-effort parse of the final
+  raw output) and counted per condition.
+
+Manual review (`manual_review.csv`): `eval.manual_review_n` sentences, abstentions
+excluded, equal allocation over (condition, section) strata, seeded with `eval.seed`.
+Fill `human_support` with supported / partial / unsupported / not_checkable.
+`verifier-agreement` binarizes (NLI entailment vs human `supported`; partial and
+unsupported = not supported; not_checkable excluded) and reports raw agreement,
+Cohen's kappa and the full confusion matrix.
+
+ROUGE-L / BERTScore (`text-metrics`) require a `hadm_id,reference` CSV; without one
+the command exits. References are never generated. See `DECISIONS.md` for every
+judgment call.

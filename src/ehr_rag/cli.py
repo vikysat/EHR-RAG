@@ -379,6 +379,110 @@ def cmd_context_tokens(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_dir(cfg: dict, run_id: str, what: str) -> "Path":
+    from ehr_rag.config import project_root
+
+    d = project_root(cfg) / "runs" / run_id
+    if not d.is_dir():
+        raise ConfigError(f"{what} run not found: {d}")
+    return d
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    """Phase 5: citation metrics, manual-review export and a 10-sentence check for one generation run."""
+    from ehr_rag.eval.citations import GROUPS
+    from ehr_rag.eval.evaluate import METRICS, gate_sample, run_evaluation
+    from ehr_rag.eval.nli import HFNLI, NLIError
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    gen_dir = _run_dir(cfg, args.generation_run, "generation")
+    seed = cfg["eval"]["seed"]
+    run = start_run(cfg, "evaluate", command="evaluate", seed=seed, run_id=args.run_id)
+    run.meta.update(generation_run=args.generation_run)
+    run.write_json("run_meta.json", run.meta)
+    print(f"run: {run.path}")
+    try:
+        nli = HFNLI(cfg["eval"]["nli_model"])
+    except NLIError as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        run.finish(status="failed", error=str(e))
+        return 4
+    print(f"NLI model {nli.model_name} revision {nli.revision}; id2label {nli.id2label}; device {nli.device}")
+    res = run_evaluation(gen_dir, run.path, run.run_id, nli, cfg["eval"]["manual_review_n"], seed)
+
+    print(f"\n== Metrics (micro-averaged; abstention lines excluded) for generation run {args.generation_run}")
+    print(f"{'condition':<13} {'scope':<27} {'sent':>5} {'abst':>5} " + " ".join(f"{m:>22}" for m in METRICS))
+    for r in res["rows"]:
+        if r["scope"] in GROUPS:
+            vals = " ".join(f"{'n/a' if r[m] is None else format(r[m], '.3f'):>22}" for m in METRICS)
+            print(f"{r['condition']:<13} {r['scope']:<27} {r['n_sentences']:>5} {r['n_abstentions']:>5} {vals}")
+    print(f"\nformat status: {res['format_counts']}")
+    print(f"\n== 10 random sentences (seed {seed}) for checking the harness by hand")
+    for i, x in enumerate(gate_sample(res["sentences"], res["texts"], 10, seed), 1):
+        print(f"\n[{i}] {x['condition']} hadm {x['hadm_id']} {x['section']}")
+        print(f"  sentence : {x['sentence']}")
+        print(f"  cited    : {x['cited_ids']}  invalid: {x['invalid_ids']}  irrelevant: {x['irrelevant_ids']}")
+        for uid, t in zip(x["cited_ids"], x["cited_texts"]):
+            print(f"    [{uid}] {t}")
+        print(f"  NLI      : {x['nli_label']}")
+    print(f"\nwrote metrics.json, metrics_by_section.csv, metrics_summary.md, sentences.jsonl, "
+          f"manual_review.csv ({res['n_manual_review']} rows) to {run.path}")
+    run.finish(nli=res["nli"], format_counts=res["format_counts"], n_manual_review=res["n_manual_review"])
+    return 0
+
+
+def cmd_verifier_agreement(args: argparse.Namespace) -> int:
+    """Phase 5: agreement between NLI labels and human labels in a labeled manual_review.csv."""
+    import json
+    from pathlib import Path
+
+    from ehr_rag.eval.agreement import agreement
+    from ehr_rag.eval.manual_review import read_manual_review
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    labels = Path(args.labels)
+    metrics_p = labels.parent / "metrics.json"
+    ent = "entailment"
+    if metrics_p.exists():
+        ent = json.loads(metrics_p.read_text(encoding="utf-8"))["nli"]["entailment_label"]
+    res = agreement(read_manual_review(labels), ent)
+    run = start_run(cfg, "verifier-agreement", command="verifier-agreement")
+    run.write_json("verifier_agreement.json", {**res, "labels": str(labels)})
+    print(json.dumps(res, indent=2))
+    run.finish()
+    print(f"run: {run.path}")
+    return 0
+
+
+def cmd_text_metrics(args: argparse.Namespace) -> int:
+    """Phase 5: ROUGE-L / BERTScore against a reference file (required; the Demo has none)."""
+    from pathlib import Path
+
+    import pandas as pd
+
+    from ehr_rag.eval.evaluate import load_generation_run
+    from ehr_rag.eval.text_metrics import ReferenceFileError, load_references, text_metrics
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    try:
+        refs = load_references(Path(args.references) if args.references else None)
+    except ReferenceFileError as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        return 2
+    gen_dir = _run_dir(cfg, args.generation_run, "generation")
+    reports = {r.hadm_id: r.raw for r in load_generation_run(gen_dir) if r.condition == args.condition}
+    rows = text_metrics(reports, refs, args.bertscore)
+    run = start_run(cfg, "text-metrics", command="text-metrics")
+    pd.DataFrame(rows).to_csv(run.path / "text_metrics.csv", index=False)
+    _print_table(pd.DataFrame(rows))
+    run.finish(n=len(rows))
+    print(f"run: {run.path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser with all subcommands."""
     parser = argparse.ArgumentParser(
@@ -417,6 +521,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="confirm when new calls exceed generation.confirm_threshold")
     p.add_argument("--no-cache", action="store_true", help="bypass the response cache (fresh calls)")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name> (used by scripts/generate.sbatch)")
+    p = add("evaluate", cmd_evaluate,
+            "Phase 5: parse reports, NLI citation metrics, manual_review.csv, 10-sentence check.")
+    p.add_argument("--generation-run", required=True, help="run id of a `generate` run")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name> (used by scripts/cli.sbatch)")
+    p = add("verifier-agreement", cmd_verifier_agreement,
+            "Phase 5: raw agreement, Cohen's kappa and confusion matrix, NLI vs your labels.")
+    p.add_argument("--labels", required=True, help="labeled manual_review.csv (from an evaluate run)")
+    p = add("text-metrics", cmd_text_metrics,
+            "Phase 5: ROUGE-L / BERTScore; REQUIRES --references (the Demo has none; never generated).")
+    p.add_argument("--generation-run", required=True, help="run id of a `generate` run")
+    p.add_argument("--references", help="CSV with columns hadm_id,reference")
+    p.add_argument("--condition", default="ehr_rag", help="condition to score (default ehr_rag)")
+    p.add_argument("--bertscore", action="store_true", help="also compute BERTScore (needs bert-score)")
     p = add("context-tokens", cmd_context_tokens,
             "Phase 4: print full_context templated-prompt tokens per admission vs max_context_tokens.")
     p.add_argument("--limit", type=int, help="only the first N selected admissions")
