@@ -52,3 +52,60 @@ better than it is, never guesses, and keeps the raw data for manual review.
   without them. It has not been tested. ROUGE-L is implemented and tested in-repo.
 - **Reference file format** (only needed if you ever have references): CSV with
   columns `hadm_id,reference`.
+
+## Phase 6: perturbation pilot
+
+- **Targets come from ehr_rag reports only**, using the final raw output (the retry
+  output if there was a format retry), parsed with the Phase 5 parser. Only trailing
+  citations link a sentence to a unit.
+- **Lab values that can be targeted:** the shown points first/max/min/last. Reference
+  bounds and counts cannot. A number equal to points from different measurements
+  (different times) is ambiguous: it is recorded as a candidate but is not eligible.
+  One measurement shown as several points (for example `n_measurements = 1`) is edited
+  in all of them together.
+- **Medications:** only `dose_val_rx` values that are a single number.
+- **Numeric matcher.** Dates and clock times are removed before matching, and
+  comma-grouped integers (`1,200`) count as one number. A `-` counts as a sign only
+  when it is not attached to a preceding word or number (in `3.3-5.1` the second
+  number is 5.1).
+- **De-duplication:** by (admission, unit, value), keeping the first sentence.
+  Selection shuffles with `perturbation.seed` and fills up to `n_targets` with at most
+  `max_targets_per_admission` per admission.
+- **Edits apply only to the matching unit type:** lab targets get
+  lab_minor/lab_major/delete; medication targets get med_dose/delete.
+- **`lab_minor`** tries ±10…20 % in a seeded order and takes the first change that is
+  still 10–20 % after rounding to the original precision, keeps the marker, and keeps
+  the unit consistent. For labs without a reference range, the marker comes from the
+  flag, which a value edit does not change.
+- **`lab_major`** needs a reference range. Normal → 1.5 × upper bound (0.7 × lower
+  bound only if there is no upper bound). Abnormal → middle of the range (needs both
+  bounds). The marker must actually change. `n_abnormal` (not rendered) is adjusted
+  by ±1.
+- **`med_dose` always doubles.** Halving can need more decimal places than the
+  original (0.5 → 0.25), which the SPEC forbids.
+- **Consistency:** after a lab edit, max must still be ≥ and min ≤ every shown point.
+  Inconsistent edits are skipped and logged (`skipped_edits.csv`). Hidden measurements
+  are not checked, because only the shown points exist in the fields.
+- **Frozen evidence check.** Before any regeneration, the unperturbed prompt is rebuilt
+  from `evidence_shown.json` plus the stored header and must equal the original
+  `prompt.txt` byte for byte; otherwise the pilot stops. Unit files must also still
+  match `evidence_shown.json`.
+- **Format retry.** Pilot and control regenerations get the same single format retry
+  as Phase 4. Their format status is reported and they are analyzed best-effort.
+- **Controls** use `sample_idx` 1..`n_controls` (0 is the original). With greedy
+  `hf_local` decoding, controls are expected to be identical; that is still a valid
+  stability measurement.
+- **Candidate sentences for outcome labels** are those citing the target id or
+  containing the lab label / drug name (case-insensitive substring of the full label).
+  Abstention lines are ignored.
+- **Outcome precedence** (value edits): both the edited and the original value stated
+  → ambiguous; else followed; else updated_miscited; else stale; no candidate sentence
+  → dropped; otherwise ambiguous. For delete: original value stated → stale; no
+  candidate → abstained; otherwise ambiguous.
+- **Manual reading:** every lab_major case and every ambiguous case is flagged
+  (`needs_manual_read`).
+- **Control stability** means the original target sentence line (text plus citations)
+  appears unchanged in the same section.
+- **Pipeline split:** `select-targets` (CPU) → `run-pilot` (GPU) →
+  `analyze-perturbation` (CPU). You can check targets and edits before spending GPU
+  time.

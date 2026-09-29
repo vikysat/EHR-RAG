@@ -408,7 +408,9 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         print(f"STOP - {e}", file=sys.stderr)
         run.finish(status="failed", error=str(e))
         return 4
-    print(f"NLI model {nli.model_name} revision {nli.revision}; id2label {nli.id2label}; device {nli.device}")
+    info = nli.info()
+    print(f"NLI model {info['model']} revision {info['revision']}; id2label {info['id2label']}; "
+          f"device {info.get('device')}")
     res = run_evaluation(gen_dir, run.path, run.run_id, nli, cfg["eval"]["manual_review_n"], seed)
 
     print(f"\n== Metrics (micro-averaged; abstention lines excluded) for generation run {args.generation_run}")
@@ -483,6 +485,109 @@ def cmd_text_metrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_select_targets(args: argparse.Namespace) -> int:
+    """Phase 6: perturbation candidates, targets and edits from the ehr_rag reports of a generation run."""
+    import pandas as pd
+
+    from ehr_rag.perturb.run_pilot import PilotError, select_and_edit
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    gen_dir = _run_dir(cfg, args.generation_run, "generation")
+    run = start_run(cfg, "select-targets", command="select-targets", seed=cfg["perturbation"]["seed"])
+    try:
+        res = select_and_edit(cfg, gen_dir, run)
+    except PilotError as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        run.finish(status="failed", error=str(e))
+        return 4
+    n_elig = sum(c.eligible for c in res["candidates"])
+    print(f"candidates: {len(res['candidates'])} ({n_elig} eligible); targets: {len(res['targets'])} "
+          f"(n_targets {cfg['perturbation']['n_targets']}, max per admission "
+          f"{cfg['perturbation']['max_targets_per_admission']}, seed {cfg['perturbation']['seed']})")
+    if res["targets"]:
+        _print_table(pd.DataFrame([{k: t.to_dict()[k] for k in ("target_id", "hadm_id", "unit_id", "unit_type",
+                                    "label", "value", "fields_matched", "sentence")} for t in res["targets"]]))
+    print(f"\nedits applied: {len(res['edits'])}; skipped: {len(res['skipped'])}")
+    for e in res["edits"]:
+        print(f"\n{e['target_id']} {e['edit_type']}: {e['original_value']} -> {e['edited_value']}")
+        print(f"  before: {e['original_text']}")
+        print(f"  after : {e['edited_text'] or '<unit removed from evidence>'}")
+    for sk in res["skipped"]:
+        print(f"SKIPPED {sk['target_id']} {sk['edit_type']}: {sk['reason']}")
+    run.finish(generation_run=args.generation_run, n_candidates=len(res["candidates"]),
+               n_targets=len(res["targets"]), n_edits=len(res["edits"]), n_skipped=len(res["skipped"]))
+    print(f"\nrun: {run.path}")
+    return 0
+
+
+def cmd_run_pilot(args: argparse.Namespace) -> int:
+    """Phase 6: regenerate with frozen evidence for every edit and control."""
+    from ehr_rag.config import validate_for_generation
+    from ehr_rag.generation.backends import BackendError, gpu_name, make_backend
+    from ehr_rag.generation.generate import ConfirmationRequired, GenerationError
+    from ehr_rag.perturb.run_pilot import PilotError, run_pilot
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    validate_for_generation(cfg)
+    tdir = _run_dir(cfg, args.targets_run, "select-targets")
+    run = start_run(cfg, "run-pilot", command="run-pilot", seed=cfg["perturbation"]["seed"], run_id=args.run_id)
+    gen = cfg["generation"]
+    run.meta.update(targets_run=args.targets_run, backend=gen["backend"], model=gen["model"], gpu_name=gpu_name(),
+                    hf_hub_offline=os.environ.get("HF_HUB_OFFLINE"))
+    run.write_json("run_meta.json", run.meta)
+    print(f"run: {run.path}")
+    try:
+        res = run_pilot(cfg, tdir, run, make_backend(gen), yes=args.yes, no_cache=args.no_cache)
+    except ConfirmationRequired as e:
+        print(f"NOT RUN: {e}")
+        run.finish(status="not_confirmed")
+        return 5
+    except (BackendError, GenerationError, PilotError, OSError, ValueError) as e:
+        print(f"STOP - pilot failed: {e}", file=sys.stderr)
+        run.finish(status="failed", error=repr(e))
+        return 4
+    except BaseException as e:
+        run.finish(status="failed", error=repr(e))
+        raise
+    print(f"\ncases: {res['n_cases']}; format status: {res['statuses']}; model calls: {res['n_api_calls']}; "
+          f"cache hits: {res['n_cache_hits']}")
+    run.finish(model_revision=res["model_revision"], reported_model_ids=res["reported_models"],
+               generation_run=res["generation_run"], format_counts=res["statuses"], n_cases=res["n_cases"],
+               n_api_calls=res["n_api_calls"], n_cache_hits=res["n_cache_hits"])
+    print(f"run: {run.path}")
+    return 0
+
+
+def cmd_analyze_perturbation(args: argparse.Namespace) -> int:
+    """Phase 6: provisional outcome labels, summary with raw counts, manual-check CSV."""
+    from ehr_rag.config import project_root
+    from ehr_rag.perturb.analyze import analyze, summary_markdown
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    pdir = _run_dir(cfg, args.pilot_run, "run-pilot")
+    run = start_run(cfg, "analyze-perturbation", command="analyze-perturbation")
+    res = analyze(pdir, project_root(cfg) / "runs", run.path)
+    print(summary_markdown(res["summary"], pdir.name))
+    print("== Worked examples (up to 3 per edit type)")
+    shown: dict[str, int] = {}
+    for r in res["rows"]:
+        if r["kind"] != "edit" or shown.get(r["edit_type"], 0) >= 3:
+            continue
+        shown[r["edit_type"]] = shown.get(r["edit_type"], 0) + 1
+        print(f"\n{r['case_id']} ({r['edit_type']}) -> {r['auto_outcome']}")
+        print(f"  original sentence : {r['original_sentence']}")
+        print(f"  edit              : {r['original_text']}")
+        print(f"                   -> {r['edited_text']}")
+        print(f"  regenerated       : {r['regenerated_candidates'] or '<no candidate sentence>'}")
+    run.finish(pilot_run=args.pilot_run, summary=res["summary"])
+    print(f"\nwrote perturbation_results.csv, perturbation_summary.md, perturbation_manual_check.csv, diffs/ "
+          f"to {run.path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser with all subcommands."""
     parser = argparse.ArgumentParser(
@@ -534,6 +639,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--references", help="CSV with columns hadm_id,reference")
     p.add_argument("--condition", default="ehr_rag", help="condition to score (default ehr_rag)")
     p.add_argument("--bertscore", action="store_true", help="also compute BERTScore (needs bert-score)")
+    p = add("select-targets", cmd_select_targets,
+            "Phase 6: candidates, targets (fixed seed) and edits from a generation run's ehr_rag reports.")
+    p.add_argument("--generation-run", required=True, help="run id of a `generate` run with ehr_rag reports")
+    p = add("run-pilot", cmd_run_pilot,
+            "Phase 6: frozen-evidence regenerations for every edit plus unperturbed controls.")
+    p.add_argument("--targets-run", required=True, help="run id of a `select-targets` run")
+    p.add_argument("--yes", action="store_true", help="confirm when new calls exceed generation.confirm_threshold")
+    p.add_argument("--no-cache", action="store_true", help="bypass the response cache (fresh calls)")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name> (used by scripts/cli.sbatch)")
+    p = add("analyze-perturbation", cmd_analyze_perturbation,
+            "Phase 6: provisional outcome labels, summary with raw counts, manual-check CSV.")
+    p.add_argument("--pilot-run", required=True, help="run id of a `run-pilot` run")
     p = add("context-tokens", cmd_context_tokens,
             "Phase 4: print full_context templated-prompt tokens per admission vs max_context_tokens.")
     p.add_argument("--limit", type=int, help="only the first N selected admissions")

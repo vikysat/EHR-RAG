@@ -87,6 +87,20 @@ python -m ehr_rag.cli verifier-agreement --labels runs/<evaluate_run_id>/manual_
 python -m ehr_rag.cli text-metrics --generation-run <id> --references refs.csv  # exits: the Demo has no references
 ```
 
+### Phase 6: perturbation pilot
+
+```bash
+python -m ehr_rag.cli select-targets --generation-run <generate_run_id>          # CPU: targets + edits
+sbatch scripts/cli.sbatch run-pilot --targets-run <select_targets_run_id> --yes  # GPU: frozen-evidence regenerations
+python -m ehr_rag.cli analyze-perturbation --pilot-run <run_pilot_run_id>        # CPU: provisional labels
+```
+
+Outputs: `candidates.csv`, `targets.csv`, `edits.jsonl`, `skipped_edits.csv` (select-targets);
+`cases/<target>__<edit|controlK>/...` and `cases.csv` (run-pilot);
+`perturbation_results.csv`, `perturbation_summary.md`, `perturbation_manual_check.csv`,
+`diffs/` (analyze-perturbation). Automated outcome labels are provisional until checked.
+See `RUNBOOK.md` for the full server sequence.
+
 ## Metric definitions (as implemented)
 
 Parsing (`eval/parse.py`): sections are split on the exact lines `### History`,

@@ -269,29 +269,31 @@ class Generator:
     n_calls: int = 0
     n_cache_hits: int = 0
 
-    def key(self, prompt: str) -> str:
-        return cache_key(prompt, self.backend, self.revision, self.params, sample_idx=0)
+    def key(self, prompt: str, sample_idx: int = 0) -> str:
+        return cache_key(prompt, self.backend, self.revision, self.params, sample_idx=sample_idx)
 
-    def call(self, prompt: str) -> tuple[Completion, dict[str, Any]]:
+    def call(self, prompt: str, sample_idx: int = 0) -> tuple[Completion, dict[str, Any]]:
         """One completion (from cache unless --no-cache) plus attempt metadata."""
-        k = self.key(prompt)
+        k = self.key(prompt, sample_idx)
         t0 = time.perf_counter()
         c = None if self.no_cache else self.cache.get(k)
         cached = c is not None
         if c is None:
             c = self.backend.generate(prompt, self.params["max_tokens"], self.params["temperature"])
             request = {"backend": self.backend.name, "model": self.backend.model, "revision": self.revision,
-                       "params": self.params, "sample_idx": 0}
+                       "params": self.params, "sample_idx": sample_idx}
             self.cache.put(k, request, c)
             self.n_calls += 1
         else:
             self.n_cache_hits += 1
         self.reported_models.add(c.model)
-        meta = {"cache_key": k, "cached": cached, "seconds": round(time.perf_counter() - t0, 3),
+        meta = {"cache_key": k, "sample_idx": sample_idx, "cached": cached, "seconds": round(time.perf_counter() - t0, 3),
                 **{f: v for f, v in c.to_dict().items() if f not in ("text", "templated_prompt")}}
         return c, meta
 
-    def run_job(self, job: Job, templates: PromptTemplates, out_dir: Path, retrieval_run: str | None) -> str:
+    def run_job(
+        self, job: Job, templates: PromptTemplates, out_dir: Path, retrieval_run: str | None, sample_idx: int = 0
+    ) -> str:
         """Generate one report (with at most one format retry); write all files; return the status."""
         _write(out_dir / "prompt.txt", job.prompt)
         _write_json(out_dir / "evidence_shown.json", {
@@ -300,7 +302,7 @@ class Generator:
             "units": [{"unit_id": u.unit_id, "unit_type": u.unit_type, "text": u.text} for u in job.evidence],
         })
         none_only = job.condition == "no_retrieval"
-        c1, m1 = self.call(job.prompt)
+        c1, m1 = self.call(job.prompt, sample_idx)
         _write(out_dir / "raw.txt", c1.text)
         if c1.templated_prompt is not None:
             _write(out_dir / "prompt_templated.txt", c1.templated_prompt)
@@ -311,7 +313,7 @@ class Generator:
         if problems:
             retry_prompt = with_format_reminder(templates, job.prompt, problems[:MAX_PROBLEMS_IN_REMINDER])
             _write(out_dir / "prompt_retry.txt", retry_prompt)
-            c2, m2 = self.call(retry_prompt)
+            c2, m2 = self.call(retry_prompt, sample_idx)
             _write(out_dir / "raw_retry.txt", c2.text)
             if c2.templated_prompt is not None:
                 _write(out_dir / "prompt_retry_templated.txt", c2.templated_prompt)
