@@ -60,3 +60,23 @@ def test_cli_pipeline(env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, caps
     pmeta = json.loads((runs / ids["run-pilot"] / "run_meta.json").read_text(encoding="utf-8"))
     assert pmeta["status"] == "ok" and pmeta["targets_run"] == ids["select-targets"]
     assert (runs / ids["analyze-perturbation"] / "perturbation_summary.md").exists()
+
+
+def test_demo_notebook_runs_top_to_bottom(env: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                          capsys: pytest.CaptureFixture) -> None:
+    """Execute every code cell of notebooks/demo.ipynb against the fake runs (no model calls)."""
+    ids = run_pipeline(env, monkeypatch)
+    capsys.readouterr()
+    nb = json.loads((Path(__file__).resolve().parents[1] / "notebooks" / "demo.ipynb").read_text(encoding="utf-8"))
+    monkeypatch.chdir(env["root"])
+    ns: dict[str, Any] = {"__name__": "__demo__"}
+    for cell in nb["cells"]:
+        if cell["cell_type"] == "code":
+            exec(compile("".join(cell["source"]), "demo.ipynb", "exec"), ns)
+    out = capsys.readouterr().out
+    assert ns["GEN_RUN"] == ids["generate"] and ns["ANALYSIS_RUN"] == ids["analyze-perturbation"]
+    assert ns["RETRIEVE_RUN"] == ids["retrieve"] and ns["EVAL_RUN"] == ids["evaluate"]
+    for text in ("Age:", "primary diagnosis:", "### Findings", "SUPPORTED", "report diff", "Perturbation summary",
+                 "provisional"):
+        assert text in out, text
+    assert "not available" not in out

@@ -9,18 +9,15 @@ from typing import Any
 import pytest
 import yaml
 
-from ehr_rag.config import SECTIONS, load_config
-from ehr_rag.data.load import load_tables
-from ehr_rag.evidence.build_units import build_all, read_header, units_dir
-from ehr_rag.evidence.schema import read_units
+from ehr_rag.config import SECTIONS
+from ehr_rag.evidence.build_units import read_header
 from ehr_rag.generation.backends import BackendError, greedy_generation_config, with_retries
 from ehr_rag.generation.generate import (
     ConfirmationRequired, GenerationError, check_format, run_generation,
 )
 from ehr_rag.generation.prompt import build_prompt, evidence_block, load_templates
-from ehr_rag.retrieval.retrieve import Encoders, evidence_record, retrieve_admission
 from ehr_rag.runs import start_run
-from fakes import MALFORMED_REPORT, FakeBackend, FakeEncoder, good_report
+from fakes import MALFORMED_REPORT, FakeBackend, good_report
 
 REPO = Path(__file__).resolve().parents[1]
 HADM = [12, 21]

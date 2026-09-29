@@ -109,3 +109,17 @@ better than it is, never guesses, and keeps the raw data for manual review.
 - **Pipeline split:** `select-targets` (CPU) → `run-pilot` (GPU) →
   `analyze-perturbation` (CPU). You can check targets and edits before spending GPU
   time.
+
+## Phase 7: demo notebook and README
+
+- **Which runs the notebook uses:** by default it follows the chain from the latest
+  successful `analyze-perturbation` run (→ pilot → targets → generation → the
+  generation's retrieve run), plus the latest `evaluate` run of that generation run.
+  Any run id can be overridden in the first code cell. Sections whose runs are missing
+  print "not available" instead of failing.
+- **Header source:** the notebook reads the patient header from the stored
+  `prompt.txt`, which is exactly what the model saw, so it needs only `runs/`, not
+  `data/`.
+- **Testing:** the notebook is tested by executing its code cells against runs
+  produced by the full CLI chain on fake data. Jupyter is not added to
+  `requirements.txt`.
