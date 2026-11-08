@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ehr_rag.config import CONDITIONS
+from ehr_rag.config import ALL_CONDITIONS
 from ehr_rag.eval.citations import GROUPS, SentenceEval, aggregate, evaluate_report, metrics_table, premise_text
 from ehr_rag.eval.manual_review import sample_sentences, write_manual_review
 from ehr_rag.eval.nli import NLI
@@ -51,7 +51,7 @@ class ReportInput:
 def load_generation_run(run_dir: Path) -> list[ReportInput]:
     """All reports of a generation run, in condition order then hadm_id."""
     out: list[ReportInput] = []
-    for cond in CONDITIONS:
+    for cond in ALL_CONDITIONS:
         cdir = run_dir / cond
         if not cdir.is_dir():
             continue
@@ -128,7 +128,7 @@ def run_evaluation(
     give the same metrics and manual-review sample as one unsharded run.
     """
     dirs = [gen_run_dirs] if isinstance(gen_run_dirs, Path) else list(gen_run_dirs)
-    reports = sorted(load_generation_runs(dirs), key=lambda r: (CONDITIONS.index(r.condition), r.hadm_id))
+    reports = sorted(load_generation_runs(dirs), key=lambda r: (ALL_CONDITIONS.index(r.condition), r.hadm_id))
     gen_name = " + ".join(d.name for d in dirs)
     sents: list[SentenceEval] = []
     per_report: list[dict[str, Any]] = []
@@ -143,7 +143,7 @@ def run_evaluation(
         fc[rep.status] = fc.get(rep.status, 0) + 1
         per_report.append({"condition": rep.condition, "hadm_id": rep.hadm_id, "status": rep.status,
                            "raw_file": rep.raw_file, "parse_flags": parsed.flags(), **aggregate(ev)})
-    conditions = [c for c in CONDITIONS if c in format_counts]
+    conditions = [c for c in ALL_CONDITIONS if c in format_counts]
     rows = metrics_table(sents, conditions)
 
     with (out_dir / "sentences.jsonl").open("w", encoding="utf-8", newline="\n") as f:

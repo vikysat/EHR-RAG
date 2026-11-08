@@ -231,3 +231,24 @@ full definitions are in `src/ehr_rag/checker/rules.py`. Choices where the task l
   direction word or the name flips the claim.
 - **Status:** fail (any error), pass (no error, something checkable), unchecked (nothing
   checkable). Unchecked lines are reported separately as checker coverage.
+
+## Enforcement
+
+- **Conditions:** `ehr_rag_enforced` / `full_context_enforced` (generate: the base prompt,
+  so a cached base report is reused, then one rewrite per failing line by the same model)
+  and `ehr_rag_filtered` / `full_context_filtered` (`enforce-filter`, CPU, no model: copies an
+  existing run's reports and drops failing lines). No `no_retrieval` variant: it cites
+  nothing, so every checkable line would be dropped.
+- **Rewrite** (`prompts/rewrite_v1.txt`, versioned like the report prompt): the line, the
+  checker's messages and ONLY its cited units. The answer's first non-blank line is used
+  (a bullet or quotes are stripped); it must end with an evidence citation, otherwise it is
+  dropped (an abstention answer is a drop too). The re-check uses the same evidence.
+- **Repair vs retreat:** repaired = passes and keeps at least as many checkable numbers
+  AND names as the original line; retreated = passes with fewer; dropped = failed twice.
+  A rewrite with no checkable content passes as unchecked and therefore counts as retreated.
+- **Emptied sections** get `Insufficient evidence. [NONE]` (logged in `sections_emptied`), so
+  the enforced report keeps the four-section format; abstentions are excluded from all
+  evaluation rates anyway. Preamble and extra sections are not carried over (counted).
+- **Files:** `enforced.txt`, `enforcement.json` (every line, its check, the rewrite prompt and
+  answer, the outcome) and `rewrites/`; `parsed.json` points `raw_file` at `enforced.txt`
+  and keeps `pre_enforcement_raw_file`, so `evaluate` and `text-metrics` read the enforced text.

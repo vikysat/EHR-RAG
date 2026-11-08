@@ -14,6 +14,10 @@ Evidence per condition:
   ehr_rag       header + the ordered evidence saved by a previous ``retrieve`` run (never re-retrieved)
   full_context  header + all units (E1..En); skipped when the templated prompt exceeds
                 ``generation.max_context_tokens`` (counted with the model's tokenizer)
+  <base>_enforced  the base condition's prompt (so a cached base report is reused), then every
+                line that fails the citation checker is rewritten once by the same model and
+                re-checked, or dropped (``checker/enforce.py``): enforced.txt, enforcement.json,
+                rewrites/
 
 The format check here only decides whether to retry once; full parsing and the
 citation metrics belong to Phase 5 (``eval/parse.py``).
@@ -31,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from ehr_rag.config import SECTIONS, project_root, resolve_path
+from ehr_rag.config import ENFORCED_CONDITIONS, SECTIONS, base_condition, project_root, resolve_path
 from ehr_rag.evidence.build_units import check_evidence_sources, read_header, units_dir
 from ehr_rag.evidence.schema import EvidenceUnit, read_units
 from ehr_rag.generation.backends import Backend, Completion
@@ -222,22 +226,23 @@ def build_jobs(
     jobs: list[Job] = []
     skipped: list[dict[str, Any]] = []
     for cond in conditions:
+        base = base_condition(cond)
         for h in hadm_ids:
-            if cond == "no_retrieval":
+            if base == "no_retrieval":
                 evidence: list[EvidenceUnit] = []
                 prompt = build_prompt(templates, headers[h], None)
-            elif cond == "ehr_rag":
+            elif base == "ehr_rag":
                 if retrieval is None:
                     raise GenerationError("ehr_rag requires the evidence of a retrieve run (--retrieval-run)")
                 evidence = retrieval[h]
                 prompt = build_prompt(templates, headers[h], evidence)
-            elif cond == "full_context":
+            elif base == "full_context":
                 evidence = list(units_by_h[h])
                 prompt = build_prompt(templates, headers[h], evidence)
             else:
                 raise GenerationError(f"unknown condition {cond!r}")
             n, exact = backend.count_tokens(prompt)
-            if cond == "full_context" and n > max_context_tokens:
+            if base == "full_context" and n > max_context_tokens:
                 skipped.append({"condition": cond, "hadm_id": h, "input_tokens": n, "tokens_exact": exact,
                                 "max_context_tokens": max_context_tokens, "n_units": len(evidence)})
                 continue
@@ -299,10 +304,10 @@ class Generator:
         _write(out_dir / "prompt.txt", job.prompt)
         _write_json(out_dir / "evidence_shown.json", {
             "hadm_id": job.hadm_id, "condition": job.condition, "prompt_version": templates.version,
-            "retrieval_run": retrieval_run if job.condition == "ehr_rag" else None,
+            "retrieval_run": retrieval_run if base_condition(job.condition) == "ehr_rag" else None,
             "units": [{"unit_id": u.unit_id, "unit_type": u.unit_type, "text": u.text} for u in job.evidence],
         })
-        none_only = job.condition == "no_retrieval"
+        none_only = base_condition(job.condition) == "no_retrieval"
         c1, m1 = self.call(job.prompt, sample_idx)
         _write(out_dir / "raw.txt", c1.text)
         if c1.templated_prompt is not None:
@@ -359,7 +364,7 @@ def run_generation(
         check_evidence_sources(units)
     headers = {h: read_header(udir, h) for h in hadm_ids}
     retrieval = None
-    if "ehr_rag" in conditions:
+    if any(base_condition(c) == "ehr_rag" for c in conditions):
         if not retrieval_run:
             raise GenerationError("condition ehr_rag needs --retrieval-run <run_id> (a saved `retrieve` run)")
         rdir = root / "runs" / retrieval_run
@@ -373,6 +378,15 @@ def run_generation(
     g = Generator(backend, ResponseCache(root / "cache" / "generation"), params, no_cache=no_cache)
     g.revision = backend.revision()
 
+    enforced = [c for c in conditions if c in ENFORCED_CONDITIONS]
+    checker = template = checker_meta = None
+    if enforced:
+        from ehr_rag.checker.enforce import load_rewrite_template
+        from ehr_rag.checker.rules import Checker, checker_hashes
+
+        checker = Checker.from_config(cfg)
+        template = load_rewrite_template(root / "prompts", cfg["checker"]["rewrite_prompt"])
+        checker_meta = checker_hashes(cfg)
     n_cached = 0 if no_cache else sum(g.cache.has(g.key(j.prompt)) for j in jobs)
     n_new = len(jobs) - n_cached
     exact = all(j.tokens_exact for j in jobs)
@@ -385,7 +399,8 @@ def run_generation(
             f"{s['max_context_tokens']:,}")
     log(f"  total: {len(jobs)} calls ({n_cached} cached, {n_new} new); estimated input tokens "
         f"{sum(j.input_tokens for j in jobs):,} ({'exact, model tokenizer' if exact else 'approximate, chars/4'}); "
-        "format retries (at most one per call) not included")
+        "format retries (at most one per call) not included"
+        + ("; enforced conditions add at most one rewrite call per failing sentence" if enforced else ""))
     run.write_json("skipped.json", skipped)
     if n_new > gen["confirm_threshold"] and not yes:
         raise ConfirmationRequired(
@@ -394,10 +409,25 @@ def run_generation(
 
     counts = {c: {"ok": 0, "ok_after_retry": 0, "format_error": 0,
                   "skipped": sum(1 for s in skipped if s["condition"] == c)} for c in conditions}
+    enforcement: dict[str, dict[str, int]] = {}
     for i, job in enumerate(jobs, 1):
-        status = g.run_job(job, templates, run.path / job.condition / str(job.hadm_id), retrieval_run)
+        out_dir = run.path / job.condition / str(job.hadm_id)
+        status = g.run_job(job, templates, out_dir, retrieval_run)
         counts[job.condition][status] += 1
-        log(f"  [{i}/{len(jobs)}] {job.condition} hadm {job.hadm_id}: {status}")
+        msg = f"  [{i}/{len(jobs)}] {job.condition} hadm {job.hadm_id}: {status}"
+        if job.condition in enforced:
+            from ehr_rag.checker.enforce import add_summaries, enforce_dir
+
+            def rewrite(prompt: str) -> tuple[str, dict[str, Any]]:
+                c, meta = g.call(prompt)
+                return c.text, meta
+
+            ctx = checker.admission(job.evidence, units_by_h[job.hadm_id])   # type: ignore[union-attr]
+            es = enforce_dir(out_dir, ctx, checker, "rewrite", rewrite, template, checker_meta)  # type: ignore[arg-type]
+            add_summaries(enforcement.setdefault(job.condition, {}), es)
+            msg += (f"; enforcement: kept {es['n_kept']}, repaired {es['n_repaired']}, "
+                    f"retreated {es['n_retreated']}, dropped {es['n_dropped']}")
+        log(msg)
     return {
         "counts": counts,
         "reported_models": sorted(g.reported_models),
@@ -405,6 +435,7 @@ def run_generation(
         "n_api_calls": g.n_calls,
         "n_cache_hits": g.n_cache_hits,
         "skipped": skipped,
+        "enforcement": enforcement,
     }
 
 

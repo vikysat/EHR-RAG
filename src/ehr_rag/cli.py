@@ -451,7 +451,7 @@ def shard(ids: list[int], shard_size: int | None, shard_index: int | None) -> tu
 
 def cmd_generate(args: argparse.Namespace) -> int:
     """Phase 4: generate reports for the configured conditions."""
-    from ehr_rag.config import CONDITIONS, validate_for_generation
+    from ehr_rag.config import GENERATE_CONDITIONS, validate_for_generation
     from ehr_rag.generation.backends import BackendError, gpu_name, make_backend
     from ehr_rag.generation.generate import ConfirmationRequired, GenerationError, run_generation
     from ehr_rag.runs import start_run
@@ -460,9 +460,9 @@ def cmd_generate(args: argparse.Namespace) -> int:
     validate_for_generation(cfg)
     gen = cfg["generation"]
     conditions = args.conditions or list(gen["conditions"])
-    bad = [c for c in conditions if c not in CONDITIONS]
+    bad = [c for c in conditions if c not in GENERATE_CONDITIONS]
     if bad:
-        raise ConfigError(f"unknown condition(s) {bad}; allowed {list(CONDITIONS)}")
+        raise ConfigError(f"unknown condition(s) {bad}; allowed {list(GENERATE_CONDITIONS)}")
     ids, shard_info = shard(_target_ids(cfg, args), args.shard_size, args.shard_index)
     run = start_run(cfg, "generate", command="generate", run_id=args.run_id)
     run.meta.update(backend=gen["backend"], model=gen["model"], conditions=conditions, hadm_ids=ids,
@@ -495,10 +495,47 @@ def cmd_generate(args: argparse.Namespace) -> int:
         print(f"{c:<14} {n['ok']:>4} {n['ok_after_retry']:>9} {n['format_error']:>13} {n['skipped']:>8}")
     print(f"\nmodel calls: {summary['n_api_calls']}; cache hits: {summary['n_cache_hits']}; "
           f"reported model id(s): {summary['reported_models']}; revision: {summary['model_revision']}")
+    if summary["enforcement"]:
+        _print_enforcement(summary["enforcement"])
     run.finish(model_revision=summary["model_revision"], reported_model_ids=summary["reported_models"],
                format_counts=summary["counts"], n_api_calls=summary["n_api_calls"],
-               n_cache_hits=summary["n_cache_hits"], skipped_full_context=summary["skipped"])
+               n_cache_hits=summary["n_cache_hits"], skipped_full_context=summary["skipped"],
+               enforcement=summary["enforcement"])
     print(f"run: {run.path}")
+    return 0
+
+
+def _print_enforcement(totals: dict) -> None:
+    """Counts only: outcomes per enforced condition and how much content was kept."""
+    print("\n== Enforcement (lines: kept / repaired / retreated / dropped; numbers kept)")
+    for c, t in totals.items():
+        share = "n/a" if not t["n_numbers_before"] else f"{t['n_numbers_after'] / t['n_numbers_before']:.3f}"
+        print(f"{c:<22} lines {t['n_lines']:>5}  kept {t['n_kept']:>5}  repaired {t['n_repaired']:>4}  "
+              f"retreated {t['n_retreated']:>4}  dropped {t['n_dropped']:>4}  "
+              f"numbers {t['n_numbers_after']}/{t['n_numbers_before']} ({share})  rewrite calls {t['n_rewrite_calls']}")
+
+
+def cmd_enforce_filter(args: argparse.Namespace) -> int:
+    """Filter-only enforcement of existing reports (CPU, no model): drop lines that fail the checker."""
+    from ehr_rag.checker.enforce import filter_generation_runs
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    gen_dirs = [_run_dir(cfg, g, "generation") for g in args.generation_run]
+    run = start_run(cfg, "enforce-filter", command="enforce-filter", run_id=args.run_id)
+    run.meta.update(generation_runs=args.generation_run, conditions=args.conditions)
+    run.write_json("run_meta.json", run.meta)
+    print(f"run: {run.path}")
+    try:
+        totals = filter_generation_runs(cfg, gen_dirs, run.path, args.conditions,
+                                        log=(lambda s: None) if _quiet(cfg) else print)
+    except (OSError, ValueError) as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        run.finish(status="failed", error=repr(e))
+        return 4
+    _print_enforcement(totals)
+    run.finish(enforcement=totals)
+    print(f"evaluate it with: evaluate --generation-run {' '.join(args.generation_run)} {run.run_id}")
     return 0
 
 
@@ -830,7 +867,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--labels", required=True, help="labeled relevance_to_label.csv")
     p.add_argument("--rankings", help="relevance_rankings.json (default: next to --labels)")
     p = add("generate", cmd_generate, "Phase 4: generate reports per condition for the selected admissions.")
-    p.add_argument("--conditions", nargs="+", help="subset of generation.conditions (default: all configured)")
+    p.add_argument("--conditions", nargs="+",
+                   help="subset of no_retrieval ehr_rag full_context ehr_rag_enforced full_context_enforced "
+                        "(default: generation.conditions)")
     p.add_argument("--limit", type=int, help="only the first N selected admissions")
     p.add_argument("--hadm-ids", nargs="*", help="restrict to these admissions (default: all selected)")
     p.add_argument("--split", nargs="+", choices=["dev", "test"],
@@ -842,6 +881,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shard-size", type=int,
                    help="admissions per shard (with --shard-index; scripts/generate_array.sbatch sets both)")
     p.add_argument("--shard-index", type=int, help="0-based shard to generate (contiguous blocks of --shard-size)")
+    p = add("enforce-filter", cmd_enforce_filter,
+            "CPU fallback: copy reports to <condition>_filtered and drop lines failing the citation checker.")
+    p.add_argument("--generation-run", required=True, nargs="+", help="run id(s) of `generate` runs (shards)")
+    p.add_argument("--conditions", nargs="+", default=["ehr_rag", "full_context"],
+                   choices=["ehr_rag", "full_context"], help="base conditions to filter (default: both)")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("evaluate", cmd_evaluate,
             "Phase 5: parse reports, NLI citation metrics, manual_review.csv, 10-sentence check.")
     p.add_argument("--generation-run", required=True, nargs="+",

@@ -1,0 +1,17 @@
+One sentence of a clinical report failed an automatic citation check: it states something that its cited evidence units do not support.
+
+Rewrite the sentence so that every number, lab, drug, diagnosis, direction (high/low/normal) and trend it states is supported by the evidence units listed below. Keep every supported fact. Remove or correct anything unsupported. Do not add facts that are not in these units.
+
+Rules:
+1. Output exactly one sentence on one line, nothing else.
+2. End the sentence with citations in the form [E3] or [E3, E7], using only IDs listed below, at most 3.
+3. Copy numbers exactly as they appear in the units.
+
+Sentence:
+{sentence}
+
+Problems found:
+{errors}
+
+Cited evidence units:
+{units}

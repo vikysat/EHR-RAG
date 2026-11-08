@@ -19,6 +19,21 @@ BACKENDS: tuple[str, ...] = ("anthropic", "openai_compatible", "hf_local")
 API_BACKENDS: tuple[str, ...] = ("anthropic", "openai_compatible")
 _LOCAL_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
 CONDITIONS: tuple[str, ...] = ("no_retrieval", "ehr_rag", "full_context")
+# Checker-enforced variants (no_retrieval has none: it cites nothing, so enforcement would drop
+# every checkable sentence). *_enforced: one rewrite per failing sentence, then drop (generate);
+# *_filtered: drop failing sentences, no model call (enforce-filter, CPU).
+ENFORCED_CONDITIONS: tuple[str, ...] = ("ehr_rag_enforced", "full_context_enforced")
+FILTERED_CONDITIONS: tuple[str, ...] = ("ehr_rag_filtered", "full_context_filtered")
+GENERATE_CONDITIONS: tuple[str, ...] = CONDITIONS + ENFORCED_CONDITIONS
+ALL_CONDITIONS: tuple[str, ...] = CONDITIONS + ENFORCED_CONDITIONS + FILTERED_CONDITIONS
+
+
+def base_condition(condition: str) -> str:
+    """``ehr_rag_enforced`` / ``ehr_rag_filtered`` -> ``ehr_rag``; base conditions map to themselves."""
+    for suffix in ("_enforced", "_filtered"):
+        if condition.endswith(suffix):
+            return condition[: -len(suffix)]
+    return condition
 EDIT_TYPES: tuple[str, ...] = ("lab_minor", "lab_major", "med_dose", "delete")
 
 _NONE = type(None)
@@ -147,7 +162,7 @@ def validate_config(cfg: dict[str, Any]) -> None:
     backend = cfg["generation"]["backend"]
     if backend is not None and backend not in BACKENDS:
         raise ConfigError(f"generation.backend: must be one of {list(BACKENDS)} or null, got {backend!r}")
-    bad = [c for c in cfg["generation"]["conditions"] if c not in CONDITIONS]
+    bad = [c for c in cfg["generation"]["conditions"] if c not in GENERATE_CONDITIONS]
     if bad:
         raise ConfigError(f"generation.conditions: unknown condition(s) {bad}")
     bad = [e for e in cfg["perturbation"]["edit_types"] if e not in EDIT_TYPES]
