@@ -70,6 +70,23 @@ def load_generation_run(run_dir: Path) -> list[ReportInput]:
     return out
 
 
+def load_generation_runs(run_dirs: list[Path]) -> list[ReportInput]:
+    """Reports of one or more generation runs (e.g. the shards of one job array), in run order.
+
+    Raises ValueError if the same (condition, admission) appears in two runs.
+    """
+    out: list[ReportInput] = []
+    seen: dict[tuple[str, int], str] = {}
+    for d in run_dirs:
+        for r in load_generation_run(d):
+            key = (r.condition, r.hadm_id)
+            if key in seen:
+                raise ValueError(f"{r.condition} hadm {r.hadm_id} is in both {seen[key]} and {d.name}")
+            seen[key] = d.name
+            out.append(r)
+    return out
+
+
 def _fmt(v: Any) -> str:
     return "n/a" if v is None else f"{v:.3f}"
 

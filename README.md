@@ -81,7 +81,7 @@ Every command that produces results writes `runs/<YYYYMMDD-HHMMSS-name>/`, conta
 | 8 | `generate --retrieval-run <id>` | GPU (`scripts/generate.sbatch`) | reports for no_retrieval / ehr_rag / full_context: `<condition>/<hadm_id>/{prompt.txt, raw.txt, parsed.json, evidence_shown.json, call.json}` |
 | 9 | `evaluate --generation-run <id>` | GPU/CPU (`scripts/cli.sbatch`) | `metrics.json`, `metrics_by_section.csv`, `metrics_summary.md`, `sentences.jsonl`, `manual_review.csv`, 10-sentence check |
 | 10 | `verifier-agreement --labels <csv>` | CPU | raw agreement, Cohen's kappa, confusion matrix (NLI vs your labels) |
-| 11 | `text-metrics --generation-run <id> --references <csv>` | CPU | ROUGE-L / BERTScore; exits without a reference file (the Demo has none) |
+| 11 | `text-metrics --generation-run <id...> --references <csv> [--bertscore]` | CPU/GPU (`scripts/cli.sbatch`) | ROUGE-L / windowed BERTScore of each report vs the admission's discharge summary; exits without a reference file (the Demo has none) |
 | 12 | `select-targets --generation-run <id>` | CPU | `candidates.csv`, `targets.csv`, `edits.jsonl`, `skipped_edits.csv` |
 | 13 | `run-pilot --targets-run <id>` | GPU (`scripts/cli.sbatch`) | frozen-evidence regenerations per edit + controls: `cases/<case_id>/...`, `cases.csv` |
 | 14 | `analyze-perturbation --pilot-run <id>` | CPU | `perturbation_results.csv`, `perturbation_summary.md`, `perturbation_manual_check.csv`, `diffs/` |
@@ -220,8 +220,21 @@ not_checkable. `verifier-agreement` binarizes the labels (NLI entailment vs huma
 `supported`; partial and unsupported count as not supported; not_checkable is
 excluded) and reports raw agreement, Cohen's kappa and the full confusion matrix.
 
-**ROUGE-L / BERTScore** (`text-metrics`) require a `hadm_id,reference` CSV; without
-one the command exits. References are never generated.
+**ROUGE-L / BERTScore** (`text-metrics`) score each generated report against the
+same admission's real discharge summary (`<cohort.out_dir>/reference/references.csv`
+from `extract-cohort`, columns `hadm_id,reference`). Without a reference file the
+command exits; references are never generated. Reports are scored as their sentence
+text only (no headers, citations or abstention lines).
+- ROUGE-L: longest common subsequence of lowercased word tokens; precision, recall, F1.
+- BERTScore: greedy cosine matching of contextual token embeddings (no idf, no baseline
+  rescaling), with `eval.bertscore_model` (default `roberta-large`) layer
+  `eval.bertscore_layer` (17). Discharge summaries are far longer than 512 tokens, so
+  each text is embedded in consecutive 510-token windows and all token embeddings are
+  matched; nothing is truncated. Implemented in-repo with transformers (no bert-score
+  package), loaded with `local_files_only=True`. Values are not identical to the
+  bert-score package's, which truncates at 512 tokens.
+- Output: `text_metrics.csv` per (condition, admission) in the run folder; the
+  command prints only counts and per-condition mean/median F1.
 
 ## Perturbation (as implemented)
 
@@ -279,5 +292,8 @@ one the command exits. References are never generated.
 - **Tested on fakes only:** Phases 4–7 were built and tested on a CPU laptop against
   fake backends, fake NLI and fake data. The first real GPU runs (RUNBOOK) are the
   first end-to-end check on real outputs.
-- **No reference reports:** ROUGE-L and BERTScore are never computed on the Demo.
-  BERTScore depends on an optional package and is untested.
+- **Reference reports only on full MIMIC-IV:** ROUGE-L and BERTScore need MIMIC-IV-Note
+  discharge summaries, so they are never computed on the Demo; they were tested only
+  on synthetic text and a tiny random encoder. A discharge summary also contains far
+  more than the structured evidence can support (narrative, follow-up), so low
+  overlap is expected for every condition.

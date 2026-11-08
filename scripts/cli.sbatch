@@ -7,12 +7,13 @@
 #SBATCH --time=02:00:00
 #SBATCH --output=runs/slurm-%j.out
 #
-# Run one GPU-using CLI command that accepts --run-id (evaluate, run-pilot, generate).
+# Run one GPU-using CLI command that accepts --run-id (evaluate, run-pilot, generate, text-metrics).
 # Submit from the repository root (runs/ must exist). The first argument is the
 # subcommand; everything after it is passed through:
 #
 #   sbatch scripts/cli.sbatch evaluate  --generation-run <generate_run_id>
 #   sbatch scripts/cli.sbatch run-pilot --targets-run <select_targets_run_id> --yes
+#   sbatch scripts/cli.sbatch text-metrics --config config/full.yaml --generation-run <ids...> --bertscore --references data/cohort/reference/references.csv
 #
 # The run folder runs/<run_id>/ gets nvidia-smi.txt, slurm_env.txt, stdout.log and
 # stderr.log next to the usual outputs. HF_HOME must already be set; HF_HUB_OFFLINE=1
@@ -27,8 +28,8 @@ fi
 CMD="$1"
 shift
 case "$CMD" in
-    evaluate|run-pilot|generate) ;;
-    *) echo "subcommand must be one of: evaluate, run-pilot, generate (got '$CMD')" >&2; exit 2 ;;
+    evaluate|run-pilot|generate|text-metrics) ;;
+    *) echo "subcommand must be one of: evaluate, run-pilot, generate, text-metrics (got '$CMD')" >&2; exit 2 ;;
 esac
 
 cd "${SLURM_SUBMIT_DIR:?submit this script with sbatch from the repository root}"

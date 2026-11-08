@@ -605,8 +605,8 @@ def cmd_text_metrics(args: argparse.Namespace) -> int:
 
     import pandas as pd
 
-    from ehr_rag.eval.evaluate import load_generation_run
-    from ehr_rag.eval.text_metrics import ReferenceFileError, load_references, text_metrics
+    from ehr_rag.eval.evaluate import load_generation_runs
+    from ehr_rag.eval.text_metrics import BERTScorer, ReferenceFileError, load_references, summarize, text_metrics
     from ehr_rag.runs import start_run
 
     cfg = load_config(args.config)
@@ -615,14 +615,31 @@ def cmd_text_metrics(args: argparse.Namespace) -> int:
     except ReferenceFileError as e:
         print(f"STOP - {e}", file=sys.stderr)
         return 2
-    gen_dir = _run_dir(cfg, args.generation_run, "generation")
-    reports = {r.hadm_id: r.raw for r in load_generation_run(gen_dir) if r.condition == args.condition}
-    rows = text_metrics(reports, refs, args.bertscore)
-    run = start_run(cfg, "text-metrics", command="text-metrics")
+    gen_dirs = [_run_dir(cfg, g, "generation") for g in args.generation_run]
+    reports = {(r.condition, r.hadm_id): r.raw for r in load_generation_runs(gen_dirs)
+               if not args.conditions or r.condition in args.conditions}
+    embedder, info = None, None
+    if args.bertscore:
+        try:
+            embedder = BERTScorer(cfg["eval"]["bertscore_model"], cfg["eval"]["bertscore_layer"])
+        except ReferenceFileError as e:
+            print(f"STOP - {e}", file=sys.stderr)
+            return 4
+        info = embedder.info()
+        print(f"BERTScore model {info['model']} revision {info['revision']} layer {info['layer']}; "
+              f"windows of {info['window_tokens']} tokens; device {info['device']}")
+    rows = text_metrics(reports, refs, embedder)
+    summary = summarize(rows)
+    run = start_run(cfg, "text-metrics", command="text-metrics", run_id=args.run_id)
     pd.DataFrame(rows).to_csv(run.path / "text_metrics.csv", index=False)
-    _print_table(pd.DataFrame(rows))
-    run.finish(n=len(rows))
-    print(f"run: {run.path}")
+    n_missing = len({h for _, h in reports} - set(refs))
+    print(f"reports: {len(reports)}; scored (have a reference): {len(rows)}; "
+          f"admissions without a reference: {n_missing}")
+    if summary:
+        _print_table(pd.DataFrame(summary))
+    run.finish(generation_runs=args.generation_run, references=str(args.references), n_reports=len(reports),
+               n_scored=len(rows), n_admissions_without_reference=n_missing, summary=summary, bertscore=info)
+    print(f"per-report scores: {run.path / 'text_metrics.csv'}\nrun: {run.path}")
     return 0
 
 
@@ -807,11 +824,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Phase 5: raw agreement, Cohen's kappa and confusion matrix, NLI vs your labels.")
     p.add_argument("--labels", required=True, help="labeled manual_review.csv (from an evaluate run)")
     p = add("text-metrics", cmd_text_metrics,
-            "Phase 5: ROUGE-L / BERTScore; REQUIRES --references (the Demo has none; never generated).")
-    p.add_argument("--generation-run", required=True, help="run id of a `generate` run")
+            "ROUGE-L / BERTScore of each report vs the admission's discharge summary; REQUIRES --references "
+            "(extract-cohort's reference/references.csv; the Demo has none; never generated).")
+    p.add_argument("--generation-run", required=True, nargs="+", help="run id(s) of `generate` runs (shards)")
     p.add_argument("--references", help="CSV with columns hadm_id,reference")
-    p.add_argument("--condition", default="ehr_rag", help="condition to score (default ehr_rag)")
-    p.add_argument("--bertscore", action="store_true", help="also compute BERTScore (needs bert-score)")
+    p.add_argument("--conditions", nargs="+", help="conditions to score (default: all in the run)")
+    p.add_argument("--bertscore", action="store_true",
+                   help="also compute BERTScore (eval.bertscore_model from the local HF cache)")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name> (used by scripts/cli.sbatch)")
     p = add("select-targets", cmd_select_targets,
             "Phase 6: candidates, targets (fixed seed) and edits from a generation run's ehr_rag reports.")
     p.add_argument("--generation-run", required=True, help="run id of a `generate` run with ehr_rag reports")

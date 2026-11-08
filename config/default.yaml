@@ -70,6 +70,8 @@ eval:
   nli_model: cross-encoder/nli-deberta-v3-base   # verify it loads; read id2label
   manual_review_n: 100
   seed: 13
+  bertscore_model: roberta-large   # text-metrics --bertscore; local HF cache only (offline)
+  bertscore_layer: 17             # bert-score's default layer for roberta-large
 
 perturbation:
   n_targets: 15

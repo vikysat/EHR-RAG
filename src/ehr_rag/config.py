@@ -80,7 +80,8 @@ SCHEMA: dict[str, Any] = {
         "confirm_threshold": _INT,
         "endpoint_is_physionet_compliant": _BOOL,
     },
-    "eval": {"nli_model": _STR, "manual_review_n": _INT, "seed": _INT},
+    "eval": {"nli_model": _STR, "manual_review_n": _INT, "seed": _INT, "bertscore_model": _STR,
+             "bertscore_layer": _INT},
     "perturbation": {
         "n_targets": _INT,
         "max_targets_per_admission": _INT,

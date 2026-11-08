@@ -59,11 +59,19 @@ better than it is, never guesses, and keeps the raw data for manual review.
 - **Verifier agreement.** Binary: NLI entailment vs human `supported` (`partial` and
   `unsupported` both count as not supported). `not_checkable` is excluded and counted.
   The full NLI × human confusion matrix is also reported.
-- **BERTScore** uses the optional `bert-score` package, which is not in
-  `requirements.txt` because the Demo has no references and the command refuses to run
-  without them. It has not been tested. ROUGE-L is implemented and tested in-repo.
-- **Reference file format** (only needed if you ever have references): CSV with
-  columns `hadm_id,reference`.
+- **BERTScore (revised)** is implemented in-repo with transformers instead of the
+  bert-score package: the package truncates at 512 tokens, which would compare a report
+  against only the opening of a discharge summary. Both texts are embedded in
+  consecutive non-overlapping 510-token windows ([CLS] + window + [SEP]) and all token
+  embeddings are greedily matched. Defaults as bert-score: roberta-large layer 17, no
+  idf, no rescaling. Windows lose context at their borders; overlapping windows were
+  not used, for simplicity. The model loads with `local_files_only=True` and never
+  downloads.
+- **What is scored:** the report's sentence text, without headers, citation brackets
+  or abstention lines, against the whole discharge summary (all of an admission's
+  discharge notes, joined). All conditions are scored by default.
+- **Reference file format:** CSV with columns `hadm_id,reference`, written by
+  `extract-cohort`.
 
 ## Phase 6: perturbation pilot
 

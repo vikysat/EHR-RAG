@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
+import yaml
 
 from ehr_rag.eval.agreement import agreement, cohen_kappa
 from ehr_rag.eval.citations import aggregate, evaluate_report, metrics_table
@@ -356,3 +359,113 @@ def test_hfnli_too_long_pairs_never_reach_the_model() -> None:
     assert nli.labels([short, long_, short]) == ["entailment", TOO_LONG, "entailment"]
     assert seen == [short] and nli.pair_tokens[long_] == 22
     assert nli.info()["n_too_long_pairs"] == 1 and nli.info()["n_truncated_pairs"] == 0
+
+
+# --------------------------------------------------------------------------- reference metrics (synthetic text)
+
+FAKE_SUMMARY = (
+    "FAKE DISCHARGE SUMMARY. Name: ___ Admission Date: ___\n"
+    "History of Present Illness: fake patient with fake chronic condition one presented with weakness.\n"
+    "Pertinent Results: Fakeium peaked at 5.9 and was 4.30 at discharge.\n"
+    "Discharge Medications: FakeDrugA 40 mg IV daily.\n"
+)
+FAKE_REPORT = (
+    "### History\nThe patient has fake chronic condition one. [E1]\n"
+    "### Findings\nFakeium peaked at 5.9. [E2][E3]\n"
+    "### Impression\nInsufficient evidence. [NONE]\n"
+    "### Recommendations\nContinue FakeDrugA 40 mg IV. [E4]\n"
+)
+
+
+def test_report_text_drops_headers_citations_and_abstentions() -> None:
+    from ehr_rag.eval.text_metrics import report_text
+
+    assert report_text(FAKE_REPORT) == ("The patient has fake chronic condition one.\nFakeium peaked at 5.9.\n"
+                                        "Continue FakeDrugA 40 mg IV.")
+
+
+def test_rouge_l_on_synthetic_summary() -> None:
+    from ehr_rag.eval.text_metrics import report_text
+
+    r = rouge_l(report_text(FAKE_REPORT), FAKE_SUMMARY)
+    assert 0 < r["precision"] <= 1 and 0 < r["recall"] < r["precision"]
+    assert rouge_l(FAKE_SUMMARY, FAKE_SUMMARY)["f1"] == pytest.approx(1.0)
+    assert rouge_l("Fakeium 5.9", "Fakeium 15.9")["f1"] == pytest.approx(0.5)     # numbers are whole tokens
+
+
+def test_windows_and_greedy_match() -> None:
+    import numpy as np
+
+    from ehr_rag.eval.text_metrics import greedy_match, windows
+
+    assert windows(list(range(7)), 3) == [[0, 1, 2], [3, 4, 5], [6]] and windows([], 3) == [[]]
+    e = np.eye(3, dtype=np.float32)
+    assert greedy_match(e, e)["f1"] == pytest.approx(1.0)
+    m = greedy_match(e[:1], e)          # candidate covers 1 of 3 reference tokens
+    assert m["precision"] == pytest.approx(1.0) and m["recall"] == pytest.approx(1 / 3)
+    assert greedy_match(e[:0], e)["f1"] == 0.0
+
+
+def _tiny_bert(path: Path, max_positions: int = 12) -> Path:
+    """A FAKE, randomly initialised 2-layer BERT with a toy vocabulary, saved locally (no download)."""
+    import torch
+    from transformers import BertConfig, BertModel, BertTokenizerFast
+
+    words = sorted({w for t in (FAKE_SUMMARY, FAKE_REPORT) for w in re.findall(r"[a-z0-9]+|[^\sa-z0-9]",
+                                                                               t.lower())})
+    path.mkdir(parents=True)
+    vocab = {w: i for i, w in enumerate(["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", *words])}
+    tok = BertTokenizerFast(vocab=vocab, model_max_length=max_positions)   # transformers 5: vocab, not vocab_file
+    torch.manual_seed(0)
+    model = BertModel(BertConfig(vocab_size=tok.vocab_size, hidden_size=16, num_hidden_layers=2,
+                                 num_attention_heads=2, intermediate_size=32, max_position_embeddings=max_positions))
+    tok.save_pretrained(path)
+    model.save_pretrained(path)
+    return path
+
+
+def test_bertscorer_windows_long_text_without_truncation(tmp_path: Path) -> None:
+    from ehr_rag.eval.text_metrics import BERTScorer, bertscore, report_text
+
+    scorer = BERTScorer(str(_tiny_bert(tmp_path / "tiny")), layer=2, device="cpu")
+    assert scorer.max_length == 12 and scorer.window == 10
+    ids = scorer.tok(FAKE_SUMMARY, add_special_tokens=False)["input_ids"]
+    n_tokens = len(ids)
+    assert n_tokens > 3 * scorer.window                         # longer than one window
+    assert scorer.tok.unk_token_id not in ids                   # the toy vocabulary covers the text
+    emb = scorer.embed(FAKE_SUMMARY)
+    assert emb.shape == (n_tokens, 16)                          # every token embedded, nothing truncated
+    assert np.allclose(np.linalg.norm(emb, axis=1), 1.0, atol=1e-5)
+    assert bertscore(scorer, FAKE_SUMMARY, FAKE_SUMMARY)["f1"] == pytest.approx(1.0, abs=1e-5)
+    s = bertscore(scorer, report_text(FAKE_REPORT), FAKE_SUMMARY)
+    assert 0 < s["f1"] < 1
+    with pytest.raises(ReferenceFileError, match="bertscore_layer"):
+        BERTScorer(str(tmp_path / "tiny"), layer=9)
+    with pytest.raises(ReferenceFileError, match="local Hugging Face cache"):
+        BERTScorer(str(tmp_path / "not-downloaded"), layer=1)
+
+
+def test_text_metrics_cli_with_synthetic_references(env: dict[str, Any], capsys: pytest.CaptureFixture) -> None:
+    from ehr_rag.cli import main
+
+    gen = _generate(env, realistic_responder)
+    root = Path(env["cfg"]["_project_root"])
+    refs = root / "fake_references.csv"
+    with refs.open("w", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerows([["hadm_id", "reference"], [12, FAKE_SUMMARY]])     # 21 has no reference
+    cfg_path = root / "config" / "test.yaml"
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    raw["eval"]["bertscore_model"] = str(_tiny_bert(root / "tiny_bert"))
+    raw["eval"]["bertscore_layer"] = 1
+    cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    capsys.readouterr()
+    assert main(["text-metrics", "--config", str(cfg_path), "--generation-run", gen.name,
+                 "--references", str(refs), "--bertscore"]) == 0
+    out = capsys.readouterr().out
+    assert "reports: 6; scored (have a reference): 3; admissions without a reference: 1" in out
+    run_dir = sorted((root / "runs").glob("*-text-metrics"))[-1]
+    with (run_dir / "text_metrics.csv").open(encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert {r["condition"] for r in rows} == {"no_retrieval", "ehr_rag", "full_context"}
+    assert all(r["hadm_id"] == "12" and 0 <= float(r["bertscore_f1"]) <= 1 for r in rows)
+    assert FAKE_SUMMARY.splitlines()[1] not in out                 # scores only, never text
