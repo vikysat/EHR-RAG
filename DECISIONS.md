@@ -262,3 +262,24 @@ full definitions are in `src/ehr_rag/checker/rules.py`. Choices where the task l
   lexicon, the rewrite prompt, and a combined hash), computed as plain file hashes.
   `validate-config` prints the combined hash; `generate`, `enforce-filter` and
   `check-citations` take `--checker-sha256` and refuse to run if the files changed.
+
+## Counterfactual citation audit
+
+- **Commands:** `audit-targets` (CPU) → `run-audit` (GPU, sharded) → `analyze-audit` (CPU).
+  They extend the Phase 6 modules: selection in `perturb/select_targets.py`, edits in
+  `perturb/edit.py`, runs in `perturb/run_pilot.py`, labels in `perturb/analyze.py`. The
+  original `select-targets` / `run-pilot` / `analyze-perturbation` are unchanged.
+- **Targets:** per admission, up to `audit.n_cited_per_admission` (3) numeric lab units of the
+  shown evidence that the plain ehr_rag report cites in any claim (list items included),
+  units with a [HIGH]/[LOW] point first; plus `audit.n_null_per_admission` (1) shown numeric
+  lab cited nowhere. Each group is shuffled with a seed per admission. Units without a
+  TWO-sided reference range (a one-sided range has no midpoint and no width) and units the
+  edit cannot be applied to are skipped, counted by reason (`audit_skips.csv`), and the next
+  unit is tried.
+- **Edits:** every shown measurement (first/max/min/last) is moved to ONE value, so the unit
+  has a single unambiguous status. Flagged ("mixed" included) → range midpoint, flags
+  cleared, `n_abnormal` 0. Normal → `ref_high + 0.5 × width`, or `ref_low − 0.5 × width`
+  for hemoglobin, hematocrit, platelets and albumin (configurable; low values are the
+  clinically usual direction for these), flag "abnormal", `n_abnormal = n_measurements`.
+  The value keeps the unit's precision; edits whose rounded value lands on the wrong side,
+  or a non-positive low value, are skipped.

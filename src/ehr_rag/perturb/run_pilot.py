@@ -209,3 +209,92 @@ def run_pilot(
     _write_json(run.path / "pilot_meta.json", {"targets_run": targets_dir.name, "generation_run": gen_run})
     return {"statuses": statuses, "n_cases": len(cases), "n_api_calls": g.n_calls, "n_cache_hits": g.n_cache_hits,
             "model_revision": g.revision, "reported_models": sorted(g.reported_models), "generation_run": gen_run}
+
+
+# --------------------------------------------------------------------------- counterfactual audit: targets and edits
+
+AUDIT_TARGET_COLUMNS = ["target_id", "hadm_id", "unit_id", "label", "kind", "status", "n_citing_claims"]
+
+
+def ehr_rag_reports(gen_dirs: list[Path]) -> dict[int, Path]:
+    """hadm_id -> the generation run holding its plain ehr_rag report (shards allowed, no duplicates)."""
+    out: dict[int, Path] = {}
+    for g in gen_dirs:
+        d = g / "ehr_rag"
+        if not d.is_dir():
+            continue
+        for p in d.iterdir():
+            if p.is_dir():
+                h = int(p.name)
+                if h in out:
+                    raise PilotError(f"ehr_rag hadm {h} is in both {out[h].name} and {g.name}")
+                out[h] = g
+    if not out:
+        raise PilotError("no plain ehr_rag reports in the given generation run(s)")
+    return out
+
+
+def cited_claim_counts(parsed: Any, checker: Any, ctx: Any) -> dict[str, int]:
+    """Unit id -> number of claims (list items included) citing it, over every non-abstention line."""
+    counts: dict[str, int] = {}
+    for s in parsed.sentences():
+        if s.is_abstention:
+            continue
+        for _, ids in checker.items(s, ctx):
+            for i in dict.fromkeys(ids):
+                if i in ctx.shown:
+                    counts[i] = counts.get(i, 0) + 1
+    return counts
+
+
+def select_audit(cfg: dict[str, Any], gen_dirs: list[Path], run: Run) -> dict[str, Any]:
+    """``audit-targets``: targets, edits and skips for every plain ehr_rag report; writes the target-run files."""
+    from ehr_rag.checker.rules import Checker
+    from ehr_rag.perturb.edit import audit_edit
+    from ehr_rag.perturb.select_targets import select_audit_targets
+
+    ac = cfg["audit"]
+    checker = Checker.from_config(cfg)
+    udir = units_dir(resolve_path(cfg, cfg["data"]["derived"]))
+    where = ehr_rag_reports(gen_dirs)
+
+    def edit(u: EvidenceUnit) -> Any:
+        return audit_edit(u, checker.lab_group(str(u.fields.get("label") or "")), ac["outside_fraction"],
+                          ac["below_range_groups"])
+
+    def editable(u: EvidenceUnit) -> str:
+        try:
+            edit(u)
+        except SkipEdit as e:
+            return str(e)
+        return ""
+
+    targets, skips, edits = [], [], []
+    for h in sorted(where):
+        raw, shown = original_report(where[h], h, "ehr_rag")
+        units = read_units(udir / f"{h}.jsonl")
+        fr = frozen_units(shown, units)
+        ctx = checker.admission(fr, units)
+        cited = cited_claim_counts(parse_report(raw), checker, ctx)
+        t, s = select_audit_targets(h, fr, cited, ac["n_cited_per_admission"], ac["n_null_per_admission"],
+                                    ac["seed"], editable)
+        targets.extend(t)
+        skips.extend(s)
+    by_id = {}
+    for i, t in enumerate(targets, 1):
+        t.target_id = f"A{i:04d}"
+        if t.hadm_id not in by_id:
+            by_id[t.hadm_id] = {u.unit_id: u for u in read_units(udir / f"{t.hadm_id}.jsonl")}
+        r = edit(by_id[t.hadm_id][t.unit_id])
+        edits.append({"target_id": t.target_id, "hadm_id": t.hadm_id, "kind": t.kind, **r.to_dict()})
+    _write_csv(run.path / "audit_targets.csv", [t.to_dict() for t in targets], AUDIT_TARGET_COLUMNS)
+    with (run.path / "audit_edits.jsonl").open("w", encoding="utf-8", newline="\n") as f:
+        for e in edits:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    _write_csv(run.path / "audit_skips.csv", skips, ["hadm_id", "unit_id", "kind", "reason"])
+    _write_json(run.path / "audit_meta.json", {"generation_runs": {str(h): g.name for h, g in where.items()},
+                                               "audit": ac})
+    reasons: dict[str, int] = {}
+    for s in skips:
+        reasons[s["reason"]] = reasons.get(s["reason"], 0) + 1
+    return {"n_admissions": len(where), "targets": targets, "edits": edits, "skips": skips, "skip_reasons": reasons}

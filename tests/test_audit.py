@@ -102,3 +102,98 @@ def test_select_on_demo_units(demo_units: list[Any]) -> None:
     assert all(not range_skip_reason(next(u for u in labs if u.unit_id == t.unit_id)) for t in targets)
     assert all(t.unit_id not in cited for t in targets if t.kind == "null")
     assert all(s["reason"] for s in skips) and skips                      # the Demo has unranged labs
+
+
+# --------------------------------------------------------------------------- task 2: edits
+
+
+def _edit(u: Any, group: str | None = None) -> Any:
+    from ehr_rag.perturb.edit import audit_edit
+
+    return audit_edit(u, group, 0.5, ["hemoglobin", "hematocrit", "platelet", "albumin"])
+
+
+def test_flagged_unit_moves_to_the_midpoint_and_loses_its_flag() -> None:
+    from ehr_rag.evidence.render import render
+
+    k = audit_units()[0]                                       # potassium 4.1 / 5.9 [HIGH] / 4.3, ref 3.3-5.1
+    r = _edit(k)
+    assert r.edit_type == "to_normal" and r.edited_value == "4.2" and r.original_value == "4.1 5.9 4.3"
+    assert all(r.edited_fields[p]["value"] == "4.2" and r.edited_fields[p]["flag"] is None
+               for p in ("first", "max", "min", "last"))
+    assert "[HIGH]" not in r.edited_text and "[LOW]" not in r.edited_text and r.edited_fields["n_abnormal"] == 0
+    assert r.edited_text == render("lab", r.edited_fields) and r.original_text == k.text
+    assert k.fields["max"]["value"] == "5.9"                     # the original unit is untouched
+
+
+def test_normal_unit_moves_outside_the_range_with_its_flag() -> None:
+    cl = audit_units()[2]                                      # chloride 101 / 103, ref 96-108
+    r = _edit(cl)
+    assert (r.edit_type, r.edited_value) == ("to_high", "114")  # 108 + 0.5 * 12, integer precision kept
+    assert r.edited_text.count("[HIGH]") == 4 and r.edited_fields["n_abnormal"] == r.edited_fields["n_measurements"]
+    assert all(r.edited_fields[p]["flag"] == "abnormal" for p in ("first", "max", "min", "last"))
+    hgb = lab("E9", "Hemoglobin", [(T1, "14.2"), (T3, "15.0")], lo="13.7", hi="17.5")
+    r = _edit(hgb, "hemoglobin")                               # configured to go below the range
+    assert (r.edit_type, r.edited_value) == ("to_low", "11.8") and r.edited_text.count("[LOW]") == 4
+
+
+def test_edit_skips() -> None:
+    from ehr_rag.perturb.edit import SkipEdit
+
+    with pytest.raises(SkipEdit, match="no reference range"):
+        _edit(audit_units()[4])
+    with pytest.raises(SkipEdit, match="not positive"):
+        _edit(lab("E9", "Platelet Count", [(T1, "20"), (T3, "30")], lo="10", hi="60"), "platelet")
+    # integer values, range 0.4-0.6: the midpoint 0.5 rounds to "1" at 0 decimals, still [HIGH]
+    with pytest.raises(SkipEdit, match="original precision"):
+        _edit(lab("E9", "Fakeone", [(T1, "2"), (T3, "2")], lo="0.4", hi="0.6"))
+
+
+@demo_only
+def test_edits_on_demo_units(demo_units: list[Any]) -> None:
+    from ehr_rag.checker.rules import Checker
+    from ehr_rag.config import load_config
+    from ehr_rag.evidence.render import lab_marker
+    from ehr_rag.perturb.edit import SkipEdit
+
+    ck = Checker.from_config(load_config(CFG_PATH))
+    n_ok = 0
+    for u in demo_units:
+        if range_skip_reason(u):
+            continue
+        try:
+            r = _edit(u, ck.lab_group(u.fields["label"]))
+        except SkipEdit:
+            continue
+        n_ok += 1
+        f = r.edited_fields
+        marks = {lab_marker(f[p]["value"], f[p]["flag"], f["ref_low"], f["ref_high"]) for p in ("first", "max", "min", "last")}
+        if lab_status(u.fields) != "normal":
+            assert marks == {""} and r.edit_type == "to_normal"
+        else:
+            assert marks in ({"[HIGH]"}, {"[LOW]"}) and r.edit_type in ("to_high", "to_low")
+        assert len({f[p]["value"] for p in ("first", "max", "min", "last")}) == 1
+    assert n_ok > 20
+
+
+def test_audit_targets_cli(env: dict[str, Any], capsys: pytest.CaptureFixture) -> None:
+    import json
+
+    from ehr_rag.cli import main
+    from ehr_rag.generation.generate import run_generation
+    from ehr_rag.runs import start_run
+    from fakes import FakeBackend, realistic_responder
+
+    gen = start_run(env["cfg"], "generate", command="generate")
+    run_generation(env["cfg"], gen, FakeBackend(realistic_responder), hadm_ids=[12, 21], conditions=["ehr_rag"],
+                   retrieval_run=env["retrieval_run"], log=lambda s: None)
+    cfg = str(env["root"] / "config" / "test.yaml")
+    assert main(["audit-targets", "--config", cfg, "--generation-run", gen.path.name,
+                 "--run-id", "20990101-000000-audit-targets"]) == 0
+    out = capsys.readouterr().out
+    assert "targets: 2 (2 cited, 0 null-edit)" in out and "to_normal" in out
+    run = env["root"] / "runs" / "20990101-000000-audit-targets"
+    edits = [json.loads(x) for x in (run / "audit_edits.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [e["edit_type"] for e in edits] == ["to_normal", "to_normal"]        # Fakeium is HIGH / LOW
+    assert json.loads((run / "audit_meta.json").read_text(encoding="utf-8"))["generation_runs"] == {
+        "12": gen.path.name, "21": gen.path.name}

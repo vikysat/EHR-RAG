@@ -802,6 +802,33 @@ def cmd_select_targets(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_audit_targets(args: argparse.Namespace) -> int:
+    """Counterfactual audit: targets and edits from the plain ehr_rag reports (CPU). Counts only."""
+    from ehr_rag.perturb.run_pilot import PilotError, select_audit
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    gen_dirs = [_run_dir(cfg, g, "generation") for g in args.generation_run]
+    run = start_run(cfg, "audit-targets", command="audit-targets", seed=cfg["audit"]["seed"], run_id=args.run_id)
+    try:
+        res = select_audit(cfg, gen_dirs, run)
+    except PilotError as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        run.finish(status="failed", error=str(e))
+        return 4
+    n_kind = {k: sum(1 for t in res["targets"] if t.kind == k) for k in ("cited", "null")}
+    n_edit: dict[str, int] = {}
+    for e in res["edits"]:
+        n_edit[e["edit_type"]] = n_edit.get(e["edit_type"], 0) + 1
+    print(f"admissions: {res['n_admissions']}; targets: {len(res['targets'])} ({n_kind['cited']} cited, "
+          f"{n_kind['null']} null-edit); edits: {n_edit}")
+    print(f"skipped units: {len(res['skips'])} {res['skip_reasons']}")
+    run.finish(generation_runs=args.generation_run, n_targets=len(res["targets"]), n_by_kind=n_kind,
+               n_by_edit=n_edit, skip_reasons=res["skip_reasons"])
+    print(f"run: {run.path}")
+    return 0
+
+
 def cmd_run_pilot(args: argparse.Namespace) -> int:
     """Phase 6: regenerate with frozen evidence for every edit and control."""
     from ehr_rag.config import validate_for_generation
@@ -977,6 +1004,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("select-targets", cmd_select_targets,
             "Phase 6: candidates, targets (fixed seed) and edits from a generation run's ehr_rag reports.")
     p.add_argument("--generation-run", required=True, help="run id of a `generate` run with ehr_rag reports")
+    p = add("audit-targets", cmd_audit_targets,
+            "Counterfactual audit: per admission up to 3 cited labs (flagged first) + 1 uncited null-edit lab, "
+            "edited to the other side of the reference range.")
+    p.add_argument("--generation-run", required=True, nargs="+", help="run id(s) with plain ehr_rag reports")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("run-pilot", cmd_run_pilot,
             "Phase 6: frozen-evidence regenerations for every edit plus unperturbed controls.")
     p.add_argument("--targets-run", required=True, help="run id of a `select-targets` run")

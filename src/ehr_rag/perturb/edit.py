@@ -175,3 +175,51 @@ def apply_edit(unit: EvidenceUnit, edit_type: str, value: str, point_names: list
         raise SkipEdit("edited value equals the original")
     return EditResult(edit_type, unit.unit_id, copy.deepcopy(unit.fields), f, unit.text,
                       render(unit.unit_type, f), value, new)
+
+
+# --------------------------------------------------------------------------- counterfactual audit edits
+#
+# ``audit_edit`` moves EVERY shown measurement of a lab unit (first/max/min/last) to one value:
+#   to_normal  unit with a [HIGH]/[LOW] point -> midpoint of the reference range; flags cleared,
+#              n_abnormal 0
+#   to_high    normal unit -> ref_high + audit.outside_fraction * (ref_high - ref_low); flags set to
+#   to_low     "abnormal", n_abnormal = n_measurements. to_low (ref_low - fraction * width) for the
+#              lab groups in audit.below_range_groups; skipped if that is not > 0
+# The value keeps the unit's original precision (most decimals among its points). The edit is
+# skipped if, after rounding, the markers are not all '' (to_normal) or all [HIGH]/[LOW].
+
+
+def audit_edit(unit: EvidenceUnit, group: str | None, outside_fraction: float,
+               below_groups: list[str]) -> EditResult:
+    """Audit edit of one lab unit (see above). Raises SkipEdit."""
+    from ehr_rag.perturb.select_targets import lab_status, range_skip_reason
+
+    reason = range_skip_reason(unit)
+    if reason:
+        raise SkipEdit(reason)
+    if unit.text != render(unit.unit_type, unit.fields):
+        raise SkipEdit("unit text does not equal render(fields); refusing to edit")
+    f0 = unit.fields
+    points = [p for p in LAB_POINTS if f0.get(p)]
+    places = max(decimal_places(f0[p]["value"]) for p in points)
+    lo, hi = (Decimal(x) for x in effective_ref(f0["ref_low"], f0["ref_high"]))
+    width = hi - lo
+    if lab_status(f0) != "normal":
+        edit_type, new, flag, want = "to_normal", (lo + hi) / 2, None, ""
+    elif group in below_groups:
+        edit_type, new, flag, want = "to_low", lo - Decimal(str(outside_fraction)) * width, "abnormal", "[LOW]"
+        if new <= 0:
+            raise SkipEdit(f"below-range value {new} is not positive")
+    else:
+        edit_type, new, flag, want = "to_high", hi + Decimal(str(outside_fraction)) * width, "abnormal", "[HIGH]"
+    value = fmt(new, places)
+    f = copy.deepcopy(f0)
+    for p in points:
+        f[p]["value"] = value
+        f[p]["flag"] = flag
+    f["n_abnormal"] = 0 if edit_type == "to_normal" else int(f.get("n_measurements", len(points)))
+    marks = {_marker(f, f[p], value) for p in points}
+    if marks != {want}:
+        raise SkipEdit(f"{value} at the original precision does not give marker {want or 'none'} ({sorted(marks)})")
+    original = " ".join(dict.fromkeys(f0[p]["value"] for p in points))
+    return EditResult(edit_type, unit.unit_id, copy.deepcopy(f0), f, unit.text, render("lab", f), original, value)
