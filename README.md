@@ -79,7 +79,8 @@ Every command that produces results writes `runs/<YYYYMMDD-HHMMSS-name>/`, conta
 | 6 | `retrieval-metrics --labels <csv>` | CPU | Recall@5 and MRR per method from your labels (relative to the pool) |
 | 7 | `context-tokens` | CPU | full_context templated-prompt tokens per admission vs `max_context_tokens` |
 | 8 | `generate --retrieval-run <id>` | GPU (`scripts/generate.sbatch`) | reports for no_retrieval / ehr_rag / full_context: `<condition>/<hadm_id>/{prompt.txt, raw.txt, parsed.json, evidence_shown.json, call.json}` |
-| 9 | `evaluate --generation-run <id>` | GPU/CPU (`scripts/cli.sbatch`) | `metrics.json`, `metrics_by_section.csv`, `metrics_summary.md`, `sentences.jsonl`, `manual_review.csv`, 10-sentence check |
+| 8b | `generate ... --shard-size 25 --shard-index <k>` | GPU (`scripts/generate_array.sbatch`, one array task per shard) | contiguous blocks of the admission list; each shard is its own run `...-generate-job<array id>-shard<k>` |
+| 9 | `evaluate --generation-run <id...>` | GPU/CPU (`scripts/cli.sbatch`) | `metrics.json`, `metrics_by_section.csv`, `metrics_summary.md`, `sentences.jsonl`, `manual_review.csv`, 10-sentence check |
 | 10 | `verifier-agreement --labels <csv>` | CPU | raw agreement, Cohen's kappa, confusion matrix (NLI vs your labels) |
 | 11 | `text-metrics --generation-run <id...> --references <csv> [--bertscore]` | CPU/GPU (`scripts/cli.sbatch`) | ROUGE-L / windowed BERTScore of each report vs the admission's discharge summary; exits without a reference file (the Demo has none) |
 | 12 | `select-targets --generation-run <id>` | CPU | `candidates.csv`, `targets.csv`, `edits.jsonl`, `skipped_edits.csv` |

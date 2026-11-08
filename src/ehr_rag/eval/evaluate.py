@@ -120,10 +120,16 @@ def summary_markdown(rows: list[dict[str, Any]], format_counts: dict[str, dict[s
 
 
 def run_evaluation(
-    gen_run_dir: Path, out_dir: Path, run_id: str, nli: NLI, manual_review_n: int, seed: int
+    gen_run_dirs: Path | list[Path], out_dir: Path, run_id: str, nli: NLI, manual_review_n: int, seed: int
 ) -> dict[str, Any]:
-    """Evaluate every report of a generation run and write all outputs to ``out_dir``."""
-    reports = load_generation_run(gen_run_dir)
+    """Evaluate every report of one or more generation runs (shards) and write all outputs to ``out_dir``.
+
+    Reports are ordered by condition then hadm_id, as within a single run, so shards
+    give the same metrics and manual-review sample as one unsharded run.
+    """
+    dirs = [gen_run_dirs] if isinstance(gen_run_dirs, Path) else list(gen_run_dirs)
+    reports = sorted(load_generation_runs(dirs), key=lambda r: (CONDITIONS.index(r.condition), r.hadm_id))
+    gen_name = " + ".join(d.name for d in dirs)
     sents: list[SentenceEval] = []
     per_report: list[dict[str, Any]] = []
     texts: dict[tuple[str, int], dict[str, str]] = {}
@@ -154,14 +160,15 @@ def run_evaluation(
         w.writerows(too_long)
     info = nli.info()
     metrics = {
-        "generation_run": gen_run_dir.name, "nli": info, "format_status": format_counts,
+        "generation_run": dirs[0].name if len(dirs) == 1 else [d.name for d in dirs], "nli": info,
+        "format_status": format_counts,
         "conditions": {c: {r["scope"]: {k: v for k, v in r.items() if k not in ("condition", "scope")}
                            for r in rows if r["condition"] == c} for c in conditions},
         "per_report": per_report,
     }
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8", newline="\n")
     (out_dir / "metrics_summary.md").write_text(
-        summary_markdown(rows, format_counts, gen_run_dir.name, info), encoding="utf-8", newline="\n")
+        summary_markdown(rows, format_counts, gen_name, info), encoding="utf-8", newline="\n")
     sample = sample_sentences(sents, manual_review_n, seed)
     write_manual_review(out_dir / "manual_review.csv", run_id, sample, texts)
     return {"rows": rows, "format_counts": format_counts, "sentences": sents, "texts": texts,

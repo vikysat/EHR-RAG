@@ -80,3 +80,71 @@ def test_demo_notebook_runs_top_to_bottom(env: dict[str, Any], monkeypatch: pyte
                  "provisional"):
         assert text in out, text
     assert "not available" not in out
+
+
+# --------------------------------------------------------------------------- sharded generation
+
+
+def test_shard_blocks_cover_all_admissions_once() -> None:
+    from ehr_rag.cli import shard
+    from ehr_rag.config import ConfigError
+
+    ids = list(range(1000, 1100))
+    parts = [shard(ids, 25, k) for k in range(4)]
+    assert [len(p) for p, _ in parts] == [25, 25, 25, 25]
+    assert [h for p, _ in parts for h in p] == ids                       # contiguous, disjoint, complete
+    assert parts[3][1] == {"shard_index": 3, "shard_size": 25, "n_shards": 4, "n_admissions_all_shards": 100}
+    assert shard(ids[:20], 25, 0)[0] == ids[:20]                          # dev: one shard
+    assert [len(shard(ids[:30], 25, k)[0]) for k in (0, 1)] == [25, 5]
+    assert shard(ids, None, None) == (ids, {})
+    with pytest.raises(ConfigError, match="indices 0..3"):
+        shard(ids, 25, 4)
+    with pytest.raises(ConfigError, match="both"):
+        shard(ids, 25, None)
+
+
+def test_sharded_generate_then_evaluate_equals_unsharded(env: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                                         capsys: pytest.CaptureFixture) -> None:
+    import ehr_rag.eval.nli as nli_mod
+    import ehr_rag.generation.backends as backends
+
+    monkeypatch.setattr(backends, "make_backend", lambda gen: FakeBackend(realistic_responder))
+    monkeypatch.setattr(nli_mod, "HFNLI", lambda name: FakeNLI())
+    root, cfg = env["root"], str(env["root"] / "config" / "test.yaml")
+    base = ["generate", "--config", cfg, "--retrieval-run", env["retrieval_run"], "--yes", "--hadm-ids", "12", "21"]
+    assert main(base + ["--run-id", "20990101-000000-generate-job7-shard0", "--shard-size", "1",
+                        "--shard-index", "0"]) == 0
+    assert main(base + ["--run-id", "20990101-000000-generate-job7-shard1", "--shard-size", "1",
+                        "--shard-index", "1"]) == 0
+    assert main(base + ["--shard-size", "1", "--shard-index", "2"]) == 2      # out of range: nothing generated
+    assert "out of range" in capsys.readouterr().err
+    runs = root / "runs"
+    m0 = json.loads((runs / "20990101-000000-generate-job7-shard0" / "run_meta.json").read_text(encoding="utf-8"))
+    assert m0["hadm_ids"] == [12] and m0["n_shards"] == 2 and m0["status"] == "ok"
+    assert sorted(p.name for p in (runs / "20990101-000000-generate-job7-shard1" / "ehr_rag").iterdir()) == ["21"]
+    full = "20990101-000000-generate-unsharded"
+    assert main(base + ["--run-id", full]) == 0
+    shards = ["20990101-000000-generate-job7-shard0", "20990101-000000-generate-job7-shard1"]
+    assert main(["evaluate", "--config", cfg, "--generation-run", *shards, "--run-id",
+                 "20990101-000001-evaluate-shards"]) == 0
+    assert main(["evaluate", "--config", cfg, "--generation-run", full, "--run-id",
+                 "20990101-000002-evaluate-full"]) == 0
+    a = json.loads((runs / "20990101-000001-evaluate-shards" / "metrics.json").read_text(encoding="utf-8"))
+    b = json.loads((runs / "20990101-000002-evaluate-full" / "metrics.json").read_text(encoding="utf-8"))
+    assert a["generation_run"] == shards and b["generation_run"] == full
+    assert a["conditions"] == b["conditions"]
+    mr = [(runs / r / "manual_review.csv").read_text(encoding="utf-8").replace(r, "RUN")
+          for r in ("20990101-000001-evaluate-shards", "20990101-000002-evaluate-full")]
+    assert mr[0] == mr[1]
+
+
+def test_overlapping_shards_are_refused(env: dict[str, Any]) -> None:
+    from ehr_rag.eval.evaluate import load_generation_runs
+    from ehr_rag.generation.generate import run_generation
+    from ehr_rag.runs import start_run
+
+    run = start_run(env["cfg"], "generate", command="generate")
+    run_generation(env["cfg"], run, FakeBackend(realistic_responder), hadm_ids=[12], conditions=["ehr_rag"],
+                   retrieval_run=env["retrieval_run"], log=lambda s: None)
+    with pytest.raises(ValueError, match="is in both"):
+        load_generation_runs([run.path, run.path])

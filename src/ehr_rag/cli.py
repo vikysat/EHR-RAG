@@ -432,6 +432,23 @@ def _target_ids(cfg: dict, args: argparse.Namespace) -> list[int]:
     return ids
 
 
+def shard(ids: list[int], shard_size: int | None, shard_index: int | None) -> tuple[list[int], dict]:
+    """Contiguous shard ``shard_index`` (0-based) of ``shard_size`` admissions; no sharding if both are None."""
+    if shard_size is None and shard_index is None:
+        return ids, {}
+    if shard_size is None or shard_index is None:
+        raise ConfigError("give both --shard-size and --shard-index")
+    if shard_size < 1:
+        raise ConfigError("--shard-size must be >= 1")
+    n_shards = -(-len(ids) // shard_size)
+    if not 0 <= shard_index < n_shards:
+        raise ConfigError(f"--shard-index {shard_index} out of range: {len(ids)} admissions in shards of "
+                          f"{shard_size} give {n_shards} shard(s), indices 0..{n_shards - 1}")
+    part = ids[shard_index * shard_size: (shard_index + 1) * shard_size]
+    return part, {"shard_index": shard_index, "shard_size": shard_size, "n_shards": n_shards,
+                  "n_admissions_all_shards": len(ids)}
+
+
 def cmd_generate(args: argparse.Namespace) -> int:
     """Phase 4: generate reports for the configured conditions."""
     from ehr_rag.config import CONDITIONS, validate_for_generation
@@ -446,13 +463,17 @@ def cmd_generate(args: argparse.Namespace) -> int:
     bad = [c for c in conditions if c not in CONDITIONS]
     if bad:
         raise ConfigError(f"unknown condition(s) {bad}; allowed {list(CONDITIONS)}")
-    ids = _target_ids(cfg, args)
+    ids, shard_info = shard(_target_ids(cfg, args), args.shard_size, args.shard_index)
     run = start_run(cfg, "generate", command="generate", run_id=args.run_id)
     run.meta.update(backend=gen["backend"], model=gen["model"], conditions=conditions, hadm_ids=ids,
                     retrieval_run=args.retrieval_run, prompt_version=gen["prompt_version"],
-                    gpu_name=gpu_name(), hf_hub_offline=os.environ.get("HF_HUB_OFFLINE"))
+                    gpu_name=gpu_name(), hf_hub_offline=os.environ.get("HF_HUB_OFFLINE"), split=args.split,
+                    **shard_info)
     run.write_json("run_meta.json", run.meta)
     print(f"run: {run.path}")
+    if shard_info:
+        print(f"shard {shard_info['shard_index']} of {shard_info['n_shards']} (0-based): {len(ids)} of "
+              f"{shard_info['n_admissions_all_shards']} admissions")
     try:
         backend = make_backend(gen)
         summary = run_generation(cfg, run, backend, hadm_ids=ids, conditions=conditions,
@@ -515,17 +536,18 @@ def _run_dir(cfg: dict, run_id: str, what: str) -> "Path":
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
-    """Phase 5: citation metrics, manual-review export and a 10-sentence check for one generation run."""
+    """Phase 5: citation metrics, manual-review export and a 10-sentence check for generation run(s)."""
     from ehr_rag.eval.citations import GROUPS
     from ehr_rag.eval.evaluate import METRICS, gate_sample, run_evaluation
     from ehr_rag.eval.nli import HFNLI, NLIError
     from ehr_rag.runs import start_run
 
     cfg = load_config(args.config)
-    gen_dir = _run_dir(cfg, args.generation_run, "generation")
+    gen_dirs = [_run_dir(cfg, g, "generation") for g in args.generation_run]
     seed = cfg["eval"]["seed"]
     run = start_run(cfg, "evaluate", command="evaluate", seed=seed, run_id=args.run_id)
-    run.meta.update(generation_run=args.generation_run)
+    # one run: its id (as before); several (shards): the list
+    run.meta.update(generation_run=args.generation_run[0] if len(gen_dirs) == 1 else args.generation_run)
     run.write_json("run_meta.json", run.meta)
     print(f"run: {run.path}")
     try:
@@ -537,9 +559,10 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     info = nli.info()
     print(f"NLI model {info['model']} revision {info['revision']}; id2label {info['id2label']}; "
           f"device {info.get('device')}")
-    res = run_evaluation(gen_dir, run.path, run.run_id, nli, cfg["eval"]["manual_review_n"], seed)
+    res = run_evaluation(gen_dirs, run.path, run.run_id, nli, cfg["eval"]["manual_review_n"], seed)
 
-    print(f"\n== Metrics (micro-averaged; abstention lines excluded) for generation run {args.generation_run}")
+    print(f"\n== Metrics (micro-averaged; abstention lines excluded) for generation run(s) "
+          f"{' '.join(args.generation_run)}")
     print(f"{'condition':<13} {'scope':<27} {'sent':>5} {'claim':>5} {'abst':>5} "
           + " ".join(f"{m:>24}" for m in METRICS))
     for r in res["rows"]:
@@ -816,9 +839,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="confirm when new calls exceed generation.confirm_threshold")
     p.add_argument("--no-cache", action="store_true", help="bypass the response cache (fresh calls)")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name> (used by scripts/generate.sbatch)")
+    p.add_argument("--shard-size", type=int,
+                   help="admissions per shard (with --shard-index; scripts/generate_array.sbatch sets both)")
+    p.add_argument("--shard-index", type=int, help="0-based shard to generate (contiguous blocks of --shard-size)")
     p = add("evaluate", cmd_evaluate,
             "Phase 5: parse reports, NLI citation metrics, manual_review.csv, 10-sentence check.")
-    p.add_argument("--generation-run", required=True, help="run id of a `generate` run")
+    p.add_argument("--generation-run", required=True, nargs="+",
+                   help="run id(s) of `generate` runs (several = the shards of one job array)")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name> (used by scripts/cli.sbatch)")
     p = add("verifier-agreement", cmd_verifier_agreement,
             "Phase 5: raw agreement, Cohen's kappa and confusion matrix, NLI vs your labels.")

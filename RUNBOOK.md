@@ -252,3 +252,124 @@ checkout's `runs/`, plus `data/derived/units/` if you want the unit views.
 | `differs from the retrieval run` / `units were rebuilt?` | units changed after retrieval or generation; redo from step 2 (or 4) |
 | job TIMEOUT in `sacct` | resubmit with `sbatch --time=04:00:00 ...`; cached calls are reused |
 | CUDA out of memory | the 3g.47gb MIG slice fits Llama-3.1-8B in bf16; check `nvidia-smi.txt` for other processes and resubmit |
+| `cohort hashes already exist` (exit 2) | the cohort is fixed; `--overwrite` only if you really want a new one |
+| `SHA-256 differs` | an id list under `data/cohort/` was changed; re-run `select-cohort` (same seed gives the same lists) |
+| `clinical notes found under the evidence data root` | a note file is under `data.root`; notes belong only in `data/cohort/reference/` |
+
+---
+
+## 10. Full MIMIC-IV cohort (dev 20 / test 100)
+
+All commands use `--config config/full.yaml`. With `data.source: full` every command
+prints counts only; ids lists, Parquet, units, notes and run outputs stay under the
+gitignored `data/`, `cache/` and `runs/`. Generation stays local (`hf_local`).
+
+### 10.0 Setup and download check (login node, internet available)
+
+```bash
+cd <path to EHR-RAG>
+git pull origin main
+source .venv/bin/activate
+pip install -r requirements.txt            # adds duckdb and pyarrow
+ln -s <MIMIC-IV root containing hosp/>      data/mimiciv
+ln -s <MIMIC-IV-Note root containing note/> data/mimic-iv-note
+ls data/mimiciv/hosp/labevents.csv.gz data/mimic-iv-note/note/discharge.csv.gz \
+   data/mimic-iv-clinical-database-demo-2.2/demo_subject_id.csv
+```
+
+Pre-download every model into `HF_HOME` (roberta-large is new: BERTScore):
+
+```bash
+python - <<'EOF'
+from huggingface_hub import snapshot_download
+for m in ["meta-llama/Llama-3.1-8B-Instruct", "ncbi/MedCPT-Query-Encoder", "ncbi/MedCPT-Article-Encoder",
+          "cross-encoder/nli-deberta-v3-base", "roberta-large"]:
+    print(m, snapshot_download(m))
+EOF
+```
+
+Download check, offline (every line must print a revision hash; any error = missing):
+
+```bash
+HF_HUB_OFFLINE=1 python - <<'EOF'
+from transformers import AutoConfig, AutoModel, AutoTokenizer
+for m in ["meta-llama/Llama-3.1-8B-Instruct", "ncbi/MedCPT-Query-Encoder", "ncbi/MedCPT-Article-Encoder",
+          "cross-encoder/nli-deberta-v3-base", "roberta-large"]:
+    print(m, AutoConfig.from_pretrained(m)._commit_hash)
+AutoTokenizer.from_pretrained("roberta-large", local_files_only=True)
+AutoModel.from_pretrained("roberta-large", local_files_only=True)
+print("roberta-large loads offline")
+EOF
+python -c "import duckdb, pyarrow; print(duckdb.__version__, pyarrow.__version__)"   # 1.5.6 26.0.1
+```
+
+### 10.1 Cohort selection (CPU; scans labevents and discharge notes once)
+
+```bash
+python -m ehr_rag.cli select-cohort --config config/full.yaml
+```
+Check the count after every filter; the last two counts must be `dev admissions 20`
+and `test admissions 100`. It writes `data/cohort/{dev,test}_hadm_ids.txt` (gitignored) and
+`config/cohort/{dev,test}_hadm_ids.sha256`. Commit only the hashes:
+```bash
+git add config/cohort/dev_hadm_ids.sha256 config/cohort/test_hadm_ids.sha256
+git status --short        # nothing else under config/cohort/, data/, cache/, runs/
+git commit -m "Cohort hashes (dev 20, test 100)" && git push origin main
+```
+
+### 10.2 Extraction (CPU)
+
+```bash
+python -m ehr_rag.cli extract-cohort --config config/full.yaml
+```
+Check: row counts per table, `discharge: admissions without a note 0`, and
+`references written 120`. Output: `data/cohort/evidence/hosp/*.parquet` and
+`data/cohort/reference/{discharge.parquet,references.csv}`.
+
+### 10.3 Schema check (headers only)
+
+```bash
+python -m ehr_rag.cli cohort-schema-check --config config/full.yaml
+```
+Expect exit 0 and `OK`. `full_not_in_demo` lists newer-release columns that extraction
+drops (fine). Any `demo_not_in_full` / `builder_not_in_full` or `extracted Parquet
+columns DIFFERENT` is exit 3: stop and report. (This also works before 10.2.)
+
+### 10.4 Evidence units (CPU)
+
+```bash
+python -m ehr_rag.cli build-units --config config/full.yaml --split dev test
+```
+Check the unit-count table (120 admissions) and the dropped summary. Units go to
+`data/derived_full/units/`.
+
+### 10.5 Retrieval on dev (CPU) → RETRIEVE_DEV
+
+```bash
+HF_HUB_OFFLINE=1 python -m ehr_rag.cli retrieve --config config/full.yaml --split dev
+HF_HUB_OFFLINE=1 python -m ehr_rag.cli context-tokens --config config/full.yaml --split dev   # optional
+```
+The last lines print `run: .../runs/<RETRIEVE_DEV>`.
+
+### 10.6 Generation on dev (GPU, job array; 20 admissions = 1 shard of 25)
+
+```bash
+sbatch --array=0 scripts/generate_array.sbatch --config config/full.yaml --split dev \
+    --retrieval-run <RETRIEVE_DEV> --yes
+```
+20 admissions × 3 conditions = 60 calls (> `confirm_threshold`, hence `--yes`).
+`cat runs/slurm-<jobid>_0.out` gives the run folder
+`runs/<date>-generate-job<jobid>-shard0`; its `stdout.log` starts with the call plan and
+ends with the format-status table. Test later: `--split test`, its own retrieve run, and
+`--array=0-3` (100 admissions = 4 shards of 25).
+
+### 10.7 Evaluation (after generation)
+
+```bash
+SHARDS=$(ls runs | grep -- "-generate-job<jobid>-shard")
+sbatch scripts/cli.sbatch evaluate --config config/full.yaml --generation-run $SHARDS
+sbatch scripts/cli.sbatch text-metrics --config config/full.yaml --generation-run $SHARDS \
+    --references data/cohort/reference/references.csv --bertscore
+```
+`evaluate` writes `gate_sample.json` instead of printing sentences;
+`text-metrics` prints counts and per-condition mean/median ROUGE-L and BERTScore F1.

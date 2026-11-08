@@ -182,3 +182,17 @@ better than it is, never guesses, and keeps the raw data for manual review.
 - **Counts only on full data:** with `data.source: full`, every command that used to
   print units, retrieved sections or report sentences writes them to its run folder
   instead (`evaluate` writes `gate_sample.json`). Ids and counts are still printed.
+
+## Sharded generation
+
+- **Shards are contiguous blocks** of the ordered admission list (`--shard-size`,
+  0-based `--shard-index`); the array script sets the index from `SLURM_ARRAY_TASK_ID`
+  and the size from `SHARD_SIZE` (default 25). An index past the last shard is a config
+  error (exit 2) and generates nothing. `--array` must be given at submission.
+- **One run folder per shard** (`<date>-generate-job<array id>-shard<k>`), so shards
+  never write the same `run_meta.json`; the response cache is shared (one file per key,
+  atomic writes).
+- **`evaluate` and `text-metrics` take several `--generation-run` ids.** Reports are
+  ordered by condition and hadm_id before scoring, so the metrics and the seeded
+  manual-review sample are identical to one unsharded run (tested). The same
+  (condition, admission) in two runs is an error. `select-targets` still takes one run.
