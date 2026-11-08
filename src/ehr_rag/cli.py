@@ -539,6 +539,51 @@ def cmd_enforce_filter(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check_citations(args: argparse.Namespace) -> int:
+    """Citation-checker statistics for generation run(s); separate from `evaluate`. Counts only."""
+    from ehr_rag.checker.report import run_check
+    from ehr_rag.checker.rules import ERROR_TYPES
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    gen_dirs = [_run_dir(cfg, g, "generation") for g in args.generation_run]
+    run = start_run(cfg, "check-citations", command="check-citations", seed=cfg["eval"]["seed"], run_id=args.run_id)
+    run.meta.update(generation_runs=args.generation_run)
+    run.write_json("run_meta.json", run.meta)
+    print(f"run: {run.path}")
+    try:
+        res = run_check(cfg, gen_dirs, run.path, args.review_n, cfg["eval"]["seed"])
+    except (OSError, ValueError) as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        run.finish(status="failed", error=repr(e))
+        return 4
+    h = run.meta["checker"]
+    print(f"checker rules sha256 {h['rules_sha256']}\n        lexicon sha256 {h['lexicon_sha256']}")
+    print("\n== Status per condition (generated text, before enforcement; lines)")
+    print(f"{'condition':<14} {'scope':<27} {'lines':>6} {'pass':>6} {'fail':>6} {'unchecked':>9} {'checkable':>9}")
+    for r in res["profile"]:
+        if r["scope"] in ("ALL", "History+Findings", "Impression+Recommendations"):
+            cs = "n/a" if r["checkable_share"] is None else f"{r['checkable_share']:.3f}"
+            print(f"{r['condition']:<14} {r['scope']:<27} {r['n_lines']:>6} {r['n_pass']:>6} {r['n_fail']:>6} "
+                  f"{r['n_unchecked']:>9} {cs:>9}")
+    print("\n== Error profile (lines with each error type, all sections)")
+    print(f"{'condition':<14} " + " ".join(f"{e:>19}" for e in ERROR_TYPES))
+    for r in res["profile"]:
+        if r["scope"] == "ALL":
+            print(f"{r['condition']:<14} " + " ".join(f"{r[e]:>19}" for e in ERROR_TYPES))
+    if res["enforcement"]:
+        print("\n== Enforcement (repair vs retreat; coverage after enforcement)")
+        for r in res["enforcement"]:
+            ls = "n/a" if r["lines_kept_share"] is None else f"{r['lines_kept_share']:.3f}"
+            ns = "n/a" if r["numbers_kept_share"] is None else f"{r['numbers_kept_share']:.3f}"
+            print(f"{r['condition']:<22} lines {r['n_lines']:>5} kept {r['kept']:>5} repaired {r['repaired']:>4} "
+                  f"retreated {r['retreated']:>4} dropped {r['dropped']:>4}  lines kept {ls}  numbers kept {ns}")
+    print(f"\nwrote checker_summary.md, checker_profile.csv, enforcement_summary.csv, checker_lines.jsonl, "
+          f"checker_review.csv ({res['n_review']} rows to check by hand) to {run.path}")
+    run.finish(profile=[r for r in res["profile"] if r["scope"] == "ALL"], enforcement=res["enforcement"])
+    return 0
+
+
 def cmd_context_tokens(args: argparse.Namespace) -> int:
     """Phase 4: templated full_context prompt tokens per admission vs max_context_tokens."""
     from ehr_rag.config import validate_for_generation
@@ -881,6 +926,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shard-size", type=int,
                    help="admissions per shard (with --shard-index; scripts/generate_array.sbatch sets both)")
     p.add_argument("--shard-index", type=int, help="0-based shard to generate (contiguous blocks of --shard-size)")
+    p = add("check-citations", cmd_check_citations,
+            "Deterministic citation-checker statistics (error profile, coverage, enforcement) for generation runs.")
+    p.add_argument("--generation-run", required=True, nargs="+", help="run id(s) of `generate` / `enforce-filter` runs")
+    p.add_argument("--review-n", type=int, default=25,
+                   help="passing and unchecked lines sampled per condition for checker_review.csv (default 25)")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("enforce-filter", cmd_enforce_filter,
             "CPU fallback: copy reports to <condition>_filtered and drop lines failing the citation checker.")
     p.add_argument("--generation-run", required=True, nargs="+", help="run id(s) of `generate` runs (shards)")

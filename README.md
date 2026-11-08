@@ -80,6 +80,9 @@ Every command that produces results writes `runs/<YYYYMMDD-HHMMSS-name>/`, conta
 | 7 | `context-tokens` | CPU | full_context templated-prompt tokens per admission vs `max_context_tokens` |
 | 8 | `generate --retrieval-run <id>` | GPU (`scripts/generate.sbatch`) | reports for no_retrieval / ehr_rag / full_context: `<condition>/<hadm_id>/{prompt.txt, raw.txt, parsed.json, evidence_shown.json, call.json}` |
 | 8b | `generate ... --shard-size 25 --shard-index <k>` | GPU (`scripts/generate_array.sbatch`, one array task per shard) | contiguous blocks of the admission list; each shard is its own run `...-generate-job<array id>-shard<k>` |
+| 8c | `generate --conditions ehr_rag ehr_rag_enforced ...` | GPU | `*_enforced`: the base report, then each line failing the citation checker is rewritten once by the same model and re-checked, or dropped: `enforced.txt`, `enforcement.json`, `rewrites/` |
+| 8d | `enforce-filter --generation-run <id...>` | CPU | no model: copies ehr_rag / full_context reports to `*_filtered` and drops failing lines |
+| 8e | `check-citations --generation-run <id...>` | CPU | checker statistics only: status and coverage, error profile per section and condition, repair vs retreat, `checker_review.csv` for tuning the lexicon |
 | 9 | `evaluate --generation-run <id...>` | GPU/CPU (`scripts/cli.sbatch`) | `metrics.json`, `metrics_by_section.csv`, `metrics_summary.md`, `sentences.jsonl`, `manual_review.csv`, 10-sentence check |
 | 10 | `verifier-agreement --labels <csv>` | CPU | raw agreement, Cohen's kappa, confusion matrix (NLI vs your labels) |
 | 11 | `text-metrics --generation-run <id...> --references <csv> [--bertscore]` | CPU/GPU (`scripts/cli.sbatch`) | ROUGE-L / windowed BERTScore of each report vs the admission's discharge summary; exits without a reference file (the Demo has none) |
@@ -161,6 +164,22 @@ Unknown or missing keys are errors.
 | `perturbation.n_targets / max_targets_per_admission / seed` | target selection |
 | `perturbation.edit_types` | subset of lab_minor, lab_major, med_dose, delete |
 | `perturbation.n_controls` | unperturbed regenerations per target |
+
+## Citation checker and enforcement
+
+A deterministic checker tests every generated line against ONLY the units it cites
+(rules: `config/checker.yaml`, vocabulary: `config/checker_lexicon.yaml`, definitions:
+`src/ehr_rag/checker/rules.py`). Error types: `invalid_id`, `number_mismatch`,
+`name_missing`, `direction_mismatch`, `trend_mismatch`, `too_many_citations`. Each line is
+`pass`, `fail` or `unchecked` (no checkable number, name, direction or trend); unchecked
+lines are reported separately as the checker's coverage. List lines are checked per item,
+each item keeping the list's opening words.
+
+The checker lives in `ehr_rag.checker`, which `ehr_rag.eval` never imports: `evaluate`
+grades enforced reports with NLI and manual labels only, and checker statistics come
+only from `check-citations`, in their own files. The SHA-256 of the rules, the lexicon and
+the rewrite prompt is in every run's `run_meta.json` (`checker`) and printed by
+`check-citations`, so the frozen versions used on dev and test can be compared.
 
 ## Metric definitions (as implemented)
 
