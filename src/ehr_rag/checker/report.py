@@ -12,6 +12,7 @@ Outputs (in the check-citations run folder):
                            checkable share, lines with each error type, numbers, names
   enforcement_summary.csv  per enforced / filtered condition: kept / repaired / retreated /
                            dropped lines, share of lines and of numbers and names kept
+  enforcement_per_report.csv  the same counts per report (for admission-bootstrap CIs)
   checker_review.csv       for tuning the lexicon by hand: every failing line plus a seeded
                            sample of passing and unchecked lines, with the cited unit texts and
                            blank columns human_checker_correct (yes/no) and notes
@@ -70,6 +71,7 @@ def check_runs(cfg: dict[str, Any], gen_dirs: list[Path]) -> dict[str, Any]:
     lines: list[dict[str, Any]] = []
     texts: dict[tuple[str, int], dict[str, str]] = {}
     enforcement: dict[str, dict[str, int]] = {}
+    per_report: list[dict[str, Any]] = []
     emptied: dict[str, int] = {}
     units_cache: dict[int, list[Any]] = {}
     for cond, d in _report_dirs(gen_dirs):
@@ -78,6 +80,8 @@ def check_runs(cfg: dict[str, Any], gen_dirs: list[Path]) -> dict[str, Any]:
             log = _read_json(d / "enforcement.json")
             add_summaries(enforcement.setdefault(cond, {}), log["summary"])
             emptied[cond] = emptied.get(cond, 0) + len(log["sections_emptied"])
+            per_report.append({"condition": cond, "hadm_id": h, **log["summary"],
+                               "n_sections_emptied": len(log["sections_emptied"])})
             continue
         meta = _read_json(d / "parsed.json")
         raw = (d / meta.get("pre_enforcement_raw_file", meta["raw_file"])).read_text(encoding="utf-8")
@@ -90,7 +94,7 @@ def check_runs(cfg: dict[str, Any], gen_dirs: list[Path]) -> dict[str, Any]:
             lines.append({"condition": cond, "hadm_id": h, **lc.to_dict()})
     for cond in enforcement:
         enforcement[cond]["n_sections_emptied"] = emptied.get(cond, 0)
-    return {"lines": lines, "texts": texts, "enforcement": enforcement}
+    return {"lines": lines, "texts": texts, "enforcement": enforcement, "enforcement_per_report": per_report}
 
 
 def _share(num: int, den: int) -> float | None:
@@ -195,7 +199,8 @@ def write_outputs(out_dir: Path, res: dict[str, Any], runs: list[str], hashes: d
     with (out_dir / "checker_lines.jsonl").open("w", encoding="utf-8", newline="\n") as f:
         for ln in res["lines"]:
             f.write(json.dumps(ln, ensure_ascii=False) + "\n")
-    for name, rows in (("checker_profile.csv", prof), ("enforcement_summary.csv", enf)):
+    for name, rows in (("checker_profile.csv", prof), ("enforcement_summary.csv", enf),
+                       ("enforcement_per_report.csv", res.get("enforcement_per_report", []))):
         with (out_dir / name).open("w", encoding="utf-8", newline="") as f:
             if rows:
                 w = csv.DictWriter(f, fieldnames=list(rows[0]))

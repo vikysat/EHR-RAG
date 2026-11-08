@@ -910,6 +910,31 @@ def cmd_analyze_audit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_make_tables(args: argparse.Namespace) -> int:
+    """Markdown versions of the paper's tables from finished runs; counts only on stdout."""
+    from pathlib import Path
+
+    from ehr_rag.runs import start_run
+    from ehr_rag.tables import make_tables
+
+    cfg = load_config(args.config)
+    dirs = {k: (_run_dir(cfg, getattr(args, k), k) if getattr(args, k) else None)
+            for k in ("evaluate_run", "check_run", "text_metrics_run", "audit_run")}
+    if not any(dirs.values()):
+        raise ConfigError("give at least one of --evaluate-run, --check-run, --text-metrics-run, --audit-run")
+    manual = Path(args.manual_labels) if args.manual_labels else None
+    run = start_run(cfg, "make-tables", command="make-tables", seed=cfg["audit"]["seed"], run_id=args.run_id)
+    counts = make_tables(run.path, eval_dir=dirs["evaluate_run"], manual=manual, check_dir=dirs["check_run"],
+                         tm_dir=dirs["text_metrics_run"], audit_dir=dirs["audit_run"],
+                         n=cfg["audit"]["bootstrap_resamples"], seed=cfg["audit"]["seed"])
+    for name, k in counts.items():
+        print(f"table {name}: {k} rows")
+    print(f"wrote tables.md and table_*.md to {run.path}")
+    run.finish(sources={k: (v.name if v else None) for k, v in dirs.items()}, manual_labels=args.manual_labels,
+               rows=counts)
+    return 0
+
+
 def cmd_run_pilot(args: argparse.Namespace) -> int:
     """Phase 6: regenerate with frozen evidence for every edit and control."""
     from ehr_rag.config import validate_for_generation
@@ -1105,6 +1130,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Counterfactual audit labels (Follows/Stale/Dropped/Other), faithfulness with bootstrap CIs, "
             "term survival, null-edit churn, manual-check CSV.")
     p.add_argument("--audit-run", required=True, nargs="+", help="run id(s) of `run-audit` runs (shards)")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
+    p = add("make-tables", cmd_make_tables,
+            "Markdown tables (support, audit, enforcement, checker profile, reference metrics) with 95%% CIs.")
+    p.add_argument("--evaluate-run", help="run id of an `evaluate` run (table 1)")
+    p.add_argument("--manual-labels", help="labeled manual_review.csv (table 1, manual unsupported)")
+    p.add_argument("--check-run", help="run id of a `check-citations` run (tables 3 and 4)")
+    p.add_argument("--text-metrics-run", help="run id of a `text-metrics` run (table 5)")
+    p.add_argument("--audit-run", help="run id of an `analyze-audit` run (table 2)")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("run-pilot", cmd_run_pilot,
             "Phase 6: frozen-evidence regenerations for every edit plus unperturbed controls.")

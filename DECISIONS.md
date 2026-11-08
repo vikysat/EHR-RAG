@@ -319,3 +319,13 @@ full definitions are in `src/ehr_rag/checker/rules.py`. Choices where the task l
   cited afterwards.
 - **Manual check:** 50 pairs, equal allocation over (condition, label) strata, round-robin,
   seeded per stratum.
+
+## Paper tables (`make-tables`)
+
+- Each table is written only when its source run is given; stdout gets row counts only.
+- Every rate is a pooled ratio with a 95% CI from `audit.bootstrap_resamples` (1,000)
+  bootstrap resamples of admissions, seeded. Table 1 recomputes the rates from the evaluation's
+  `sentences.jsonl` (same definitions as `evaluate`, plus the CIs); "manual unsupported" is
+  human_support = unsupported over labeled rows, not_checkable excluded. Table 3 uses the
+  per-report enforcement counts that `check-citations` now writes (`enforcement_per_report.csv`).
+  Table 5 is the mean F1 per report. Groups with no sentences are left out.
