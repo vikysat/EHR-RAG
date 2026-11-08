@@ -56,13 +56,38 @@ def _git_commit(root: Path) -> str | None:
     return res.stdout.strip() or None
 
 
-def _checker_hashes(cfg: dict[str, Any]) -> dict[str, Any] | None:
-    """Hashes of the frozen checker rules, lexicon and rewrite prompt (``checker.rules.checker_hashes``)."""
+def checker_hashes(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """SHA-256 of the frozen checker rules, lexicon and rewrite prompt (None if a file is missing),
+    plus a combined hash. Plain file hashes: this never imports the checker, so evaluation stays
+    independent of it."""
     if "checker" not in cfg:
         return None
-    from ehr_rag.checker.rules import checker_hashes
+    import hashlib
 
-    return checker_hashes(cfg)
+    from ehr_rag.config import resolve_path
+
+    c = cfg["checker"]
+    paths = {"rules": resolve_path(cfg, c["rules"]), "lexicon": resolve_path(cfg, c["lexicon"]),
+             "rewrite_prompt": project_root(cfg) / "prompts" / f"{c['rewrite_prompt']}.txt"}
+    out: dict[str, Any] = {}
+    for k, path in paths.items():
+        out[f"{k}_path"] = str(path)
+        out[f"{k}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    parts = [out[f"{k}_sha256"] or "missing" for k in paths]
+    out["combined_sha256"] = hashlib.sha256("|".join(parts).encode("ascii")).hexdigest()
+    return out
+
+
+def check_frozen_checker(cfg: dict[str, Any], expected: str | None) -> None:
+    """Refuse to run if ``expected`` is given and differs from the combined checker hash."""
+    if expected is None:
+        return
+    got = (checker_hashes(cfg) or {}).get("combined_sha256")
+    if got != expected:
+        from ehr_rag.config import ConfigError
+
+        raise ConfigError(f"checker files changed: combined sha256 is {got}, expected {expected} "
+                          "(rules, lexicon and rewrite prompt must stay frozen for the test run)")
 
 
 def make_run_id(name: str, now: datetime | None = None) -> str:
@@ -136,7 +161,7 @@ def start_run(
         "platform": platform.platform(),
         "git_commit": _git_commit(project_root(cfg)),
         "packages": _package_versions(),
-        "checker": _checker_hashes(cfg),
+        "checker": checker_hashes(cfg),
     }
     run = Run(run_id=run_id, path=path, meta=meta)
     run.write_json("run_meta.json", meta)

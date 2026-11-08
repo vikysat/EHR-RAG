@@ -22,6 +22,12 @@ def cmd_validate_config(args: argparse.Namespace) -> int:
     """Load and validate the config, then print the resolved version."""
     cfg = load_config(args.config)
     print(yaml.safe_dump(public_config(cfg), sort_keys=False, allow_unicode=True))
+    from ehr_rag.runs import checker_hashes
+
+    h = checker_hashes(cfg) or {}
+    print(f"checker: rules {h.get('rules_sha256')}, lexicon {h.get('lexicon_sha256')}, rewrite prompt "
+          f"{h.get('rewrite_prompt_sha256')}; combined sha256 {h.get('combined_sha256')} "
+          "(pass it as --checker-sha256 to freeze the checker for a run)")
     print(f"OK: {args.config} is valid (project root: {cfg['_project_root']})")
     return 0
 
@@ -464,6 +470,9 @@ def cmd_generate(args: argparse.Namespace) -> int:
     if bad:
         raise ConfigError(f"unknown condition(s) {bad}; allowed {list(GENERATE_CONDITIONS)}")
     ids, shard_info = shard(_target_ids(cfg, args), args.shard_size, args.shard_index)
+    from ehr_rag.runs import check_frozen_checker
+
+    check_frozen_checker(cfg, args.checker_sha256)
     run = start_run(cfg, "generate", command="generate", run_id=args.run_id)
     run.meta.update(backend=gen["backend"], model=gen["model"], conditions=conditions, hadm_ids=ids,
                     retrieval_run=args.retrieval_run, prompt_version=gen["prompt_version"],
@@ -522,6 +531,9 @@ def cmd_enforce_filter(args: argparse.Namespace) -> int:
 
     cfg = load_config(args.config)
     gen_dirs = [_run_dir(cfg, g, "generation") for g in args.generation_run]
+    from ehr_rag.runs import check_frozen_checker
+
+    check_frozen_checker(cfg, args.checker_sha256)
     run = start_run(cfg, "enforce-filter", command="enforce-filter", run_id=args.run_id)
     run.meta.update(generation_runs=args.generation_run, conditions=args.conditions)
     run.write_json("run_meta.json", run.meta)
@@ -547,6 +559,9 @@ def cmd_check_citations(args: argparse.Namespace) -> int:
 
     cfg = load_config(args.config)
     gen_dirs = [_run_dir(cfg, g, "generation") for g in args.generation_run]
+    from ehr_rag.runs import check_frozen_checker
+
+    check_frozen_checker(cfg, args.checker_sha256)
     run = start_run(cfg, "check-citations", command="check-citations", seed=cfg["eval"]["seed"], run_id=args.run_id)
     run.meta.update(generation_runs=args.generation_run)
     run.write_json("run_meta.json", run.meta)
@@ -558,7 +573,8 @@ def cmd_check_citations(args: argparse.Namespace) -> int:
         run.finish(status="failed", error=repr(e))
         return 4
     h = run.meta["checker"]
-    print(f"checker rules sha256 {h['rules_sha256']}\n        lexicon sha256 {h['lexicon_sha256']}")
+    print(f"checker rules sha256 {h['rules_sha256']}; lexicon sha256 {h['lexicon_sha256']}; "
+          f"combined {h['combined_sha256']}")
     print("\n== Status per condition (generated text, before enforcement; lines)")
     print(f"{'condition':<14} {'scope':<27} {'lines':>6} {'pass':>6} {'fail':>6} {'unchecked':>9} {'checkable':>9}")
     for r in res["profile"]:
@@ -926,17 +942,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shard-size", type=int,
                    help="admissions per shard (with --shard-index; scripts/generate_array.sbatch sets both)")
     p.add_argument("--shard-index", type=int, help="0-based shard to generate (contiguous blocks of --shard-size)")
+    p.add_argument("--checker-sha256", help="refuse to run unless the checker files' combined sha256 equals this")
     p = add("check-citations", cmd_check_citations,
             "Deterministic citation-checker statistics (error profile, coverage, enforcement) for generation runs.")
     p.add_argument("--generation-run", required=True, nargs="+", help="run id(s) of `generate` / `enforce-filter` runs")
     p.add_argument("--review-n", type=int, default=25,
                    help="passing and unchecked lines sampled per condition for checker_review.csv (default 25)")
+    p.add_argument("--checker-sha256", help="refuse to run unless the checker files' combined sha256 equals this")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("enforce-filter", cmd_enforce_filter,
             "CPU fallback: copy reports to <condition>_filtered and drop lines failing the citation checker.")
     p.add_argument("--generation-run", required=True, nargs="+", help="run id(s) of `generate` runs (shards)")
     p.add_argument("--conditions", nargs="+", default=["ehr_rag", "full_context"],
                    choices=["ehr_rag", "full_context"], help="base conditions to filter (default: both)")
+    p.add_argument("--checker-sha256", help="refuse to run unless the checker files' combined sha256 equals this")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("evaluate", cmd_evaluate,
             "Phase 5: parse reports, NLI citation metrics, manual_review.csv, 10-sentence check.")

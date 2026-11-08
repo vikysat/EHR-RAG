@@ -115,7 +115,9 @@ def summary_markdown(rows: list[dict[str, Any]], format_counts: dict[str, dict[s
     for c, n in format_counts.items():
         lines.append(f"| {c} | {n.get('ok', 0)} | {n.get('ok_after_retry', 0)} | {n.get('format_error', 0)} |")
     lines += ["", SUMMARY_NOTE, "", "Per-section values: `metrics_by_section.csv`. Definitions: README "
-              "'Metric definitions'.", ""]
+              "'Metric definitions'.", "",
+              "The deterministic citation checker is NOT used here (it selected the *_enforced / *_filtered "
+              "text); its statistics come only from `check-citations`.", ""]
     return "\n".join(lines)
 
 

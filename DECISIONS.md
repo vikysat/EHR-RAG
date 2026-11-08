@@ -252,3 +252,13 @@ full definitions are in `src/ehr_rag/checker/rules.py`. Choices where the task l
 - **Files:** `enforced.txt`, `enforcement.json` (every line, its check, the rewrite prompt and
   answer, the outcome) and `rewrites/`; `parsed.json` points `raw_file` at `enforced.txt`
   and keeps `pre_enforcement_raw_file`, so `evaluate` and `text-metrics` read the enforced text.
+
+## Evaluation independent of the checker
+
+- `ehr_rag.eval` and `ehr_rag.runs` never import `ehr_rag.checker` (tested by walking the
+  import graph, lazy imports included). `evaluate` grades enforced and filtered reports
+  with NLI only; checker statistics exist only in `check-citations` outputs.
+- **Frozen checker:** every run's `run_meta.json` has `checker` (SHA-256 of the rules, the
+  lexicon, the rewrite prompt, and a combined hash), computed as plain file hashes.
+  `validate-config` prints the combined hash; `generate`, `enforce-filter` and
+  `check-citations` take `--checker-sha256` and refuse to run if the files changed.

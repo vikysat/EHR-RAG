@@ -49,7 +49,6 @@ otherwise ("no checkable content"; reported separately to measure coverage).
 from __future__ import annotations
 
 import bisect
-import hashlib
 import re
 from dataclasses import asdict, dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
@@ -80,29 +79,17 @@ class CheckerError(ValueError):
 # --------------------------------------------------------------------------- config files and hashes
 
 
-def _sha(path: Path) -> str | None:
-    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-
-
 def checker_paths(cfg: dict[str, Any]) -> dict[str, Path]:
-    """Resolved paths of the rules file, the lexicon and the rewrite prompt template."""
+    """Resolved paths of the rules file and the lexicon."""
     c = cfg["checker"]
-    from ehr_rag.config import project_root
-
-    return {"rules": resolve_path(cfg, c["rules"]), "lexicon": resolve_path(cfg, c["lexicon"]),
-            "rewrite_prompt": project_root(cfg) / "prompts" / f"{c['rewrite_prompt']}.txt"}
+    return {"rules": resolve_path(cfg, c["rules"]), "lexicon": resolve_path(cfg, c["lexicon"])}
 
 
 def checker_hashes(cfg: dict[str, Any]) -> dict[str, Any]:
-    """SHA-256 of the checker rules, lexicon and rewrite prompt (None if a file is missing), plus a combined hash."""
-    paths = checker_paths(cfg)
-    out: dict[str, Any] = {}
-    for k, p in paths.items():
-        out[f"{k}_path"] = str(p)
-        out[f"{k}_sha256"] = _sha(p)
-    parts = [out[f"{k}_sha256"] or "missing" for k in ("rules", "lexicon", "rewrite_prompt")]
-    out["combined_sha256"] = hashlib.sha256("|".join(parts).encode("ascii")).hexdigest()
-    return out
+    """Hashes of the rules, lexicon and rewrite prompt (``runs.checker_hashes``)."""
+    from ehr_rag.runs import checker_hashes as file_hashes
+
+    return file_hashes(cfg) or {}
 
 
 # --------------------------------------------------------------------------- text helpers
