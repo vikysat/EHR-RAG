@@ -96,8 +96,12 @@ def make_fake_mimic(root: Path) -> tuple[Path, Path, Path]:
         if _has_note(s):
             notes.append([f"{s}-DS-1", s, BASE + s * 10 + 2, "DS", 1, "", "",
                           f'FAKE discharge summary {s}, line one.\nLine two with "quotes", commas, 5.9.'])
+    notes.append(["4-DS-2", 4, BASE + 42, "DS", 2, "", "", "FAKE addendum for subject 4."])
     _write_gz(note / "note" / "discharge.csv.gz", notes)
-    demo.mkdir(parents=True)
+    # The FAKE Demo: same headers as the fake full data minus its full-only column (an "earlier release").
+    for name, rows in fake_tables().items():
+        header = [c for c in rows[0] if c != "new_full_only_column"]
+        _write_gz(demo / "hosp" / f"{name}.csv.gz", [header])
     (demo / "demo_subject_id.csv").write_text("subject_id\n" + "".join(f"{s}\n" for s in sorted(DEMO_SUBJECTS)),
                                               encoding="utf-8")
     return mimic, note, demo
@@ -205,3 +209,89 @@ def test_select_cohort_cli(tmp_path: Path, fake_mimic: tuple[Path, Path, Path],
     assert "already exist" in capsys.readouterr().err
     assert main(["select-cohort", "--config", str(cfg_path), "--overwrite"]) == 0
     assert load_split_ids(cfg, "dev") == dev
+
+
+# --------------------------------------------------------------------------- extraction and schema check
+
+
+def _build(cfg_path: Path, root: Path, ids: list[int], out: Path) -> list[dict[str, Any]]:
+    import copy
+
+    from ehr_rag.data.load import load_tables
+    from ehr_rag.evidence.build_units import build_all
+
+    cfg = copy.deepcopy(load_config(cfg_path))
+    cfg["data"]["root"] = str(root)
+    _, dropped = build_all(load_tables(cfg), ids, cfg["units"], out)
+    return dropped
+
+
+def test_extract_keeps_demo_columns_and_builds_identical_units(
+        tmp_path: Path, fake_mimic: tuple[Path, Path, Path]) -> None:
+    from ehr_rag.data.cohort import NOTE_COLUMNS, extract_cohort
+    from ehr_rag.data.load import find_table_files, read_header
+    from ehr_rag.eval.text_metrics import load_references
+
+    mimic, note, demo = fake_mimic
+    cfg_path = _cohort_config(tmp_path, mimic, note, demo)
+    ids = [BASE + 42, BASE + 52, BASE + 62]   # subject 4: two notes, 5: one note, 6: none
+    ev, ref = tmp_path / "ext" / "evidence", tmp_path / "ext" / "reference"
+    lines: list[str] = []
+    res = extract_cohort(mimic, demo, ids, ev, find_note_file(note), ref, log=lines.append)
+    files = find_table_files(ev)
+    demo_files = find_table_files(demo)
+    assert all(read_header(files[t]) == read_header(demo_files[t]) for t in files)   # Demo columns, Demo order
+    assert "new_full_only_column" not in read_header(files["admissions"])
+    assert res["n_subjects"] == 3 and res["rows"]["admissions"] == 6          # every admission of the patients
+    assert res["rows"]["labevents"] == sum(3 + _n_labs2(s) + 1 for s in (4, 5, 6))  # incl. null-hadm rows
+    assert res["rows"]["d_icd_diagnoses"] == 1
+    assert res["notes"]["admissions without a note"] == 1 and res["notes"]["admissions with several notes"] == 1
+    refs = load_references(ref / "references.csv")
+    assert set(refs) == {BASE + 42, BASE + 52}
+    assert refs[BASE + 52] == 'FAKE discharge summary 5, line one.\nLine two with "quotes", commas, 5.9.'
+    assert refs[BASE + 42].endswith("\n\nFAKE addendum for subject 4.")
+    assert set(NOTE_COLUMNS) <= set(read_header(ref / "discharge.parquet"))
+    assert not any("FAKE" in ln for ln in lines)                               # counts only, never text
+    # the existing builder runs unchanged on the Parquet and gives byte-identical units
+    a, b = tmp_path / "units_csv", tmp_path / "units_parquet"
+    assert _build(cfg_path, mimic, ids, a) == _build(cfg_path, ev, ids, b)
+    names = sorted(p.name for p in a.iterdir())
+    assert names == sorted(p.name for p in b.iterdir()) and len(names) == 6
+    assert all((a / n).read_bytes() == (b / n).read_bytes() for n in names)
+
+
+def test_schema_report_and_missing_demo_column(tmp_path: Path, fake_mimic: tuple[Path, Path, Path]) -> None:
+    from ehr_rag.data.cohort import extract_cohort, schema_ok, schema_report
+    from ehr_rag.data.load import SchemaError
+
+    mimic, note, demo = fake_mimic
+    rep = schema_report(mimic, demo, None, find_note_file(note))
+    assert rep["admissions"]["full_not_in_demo"] == ["new_full_only_column"]
+    assert rep["admissions"]["demo_not_in_full"] == [] and schema_ok(rep)
+    assert rep["discharge"]["required_not_in_full"] == []
+    # a column the Demo has but the full data lacks blocks extraction
+    _write_gz(demo / "hosp" / "patients.csv.gz",
+              [["subject_id", "gender", "anchor_age", "anchor_year", "anchor_year_group", "dod", "old_col"]])
+    rep = schema_report(mimic, demo, None, None)
+    assert rep["patients"]["demo_not_in_full"] == ["old_col"] and not schema_ok(rep)
+    with pytest.raises(SchemaError, match="old_col"):
+        extract_cohort(mimic, demo, [BASE + 42], tmp_path / "e", None, tmp_path / "r", log=lambda s: None)
+
+
+def test_extract_and_schema_cli(tmp_path: Path, fake_mimic: tuple[Path, Path, Path],
+                                capsys: pytest.CaptureFixture) -> None:
+    from ehr_rag.cli import main
+    from ehr_rag.data.cohort import evidence_root, reference_dir
+
+    cfg_path = _cohort_config(tmp_path, *fake_mimic)
+    assert main(["select-cohort", "--config", str(cfg_path)]) == 0
+    assert main(["extract-cohort", "--config", str(cfg_path), "--splits", "dev"]) == 0
+    cfg = load_config(cfg_path)
+    assert (evidence_root(cfg) / "hosp" / "labevents.parquet").exists()
+    assert (reference_dir(cfg) / "references.csv").exists()
+    capsys.readouterr()
+    assert main(["cohort-schema-check", "--config", str(cfg_path)]) == 0
+    out = capsys.readouterr().out
+    assert "new_full_only_column" in out and "same as the Demo" in out and "OK:" in out
+    ids_path(cfg, "dev").write_text("1\n", encoding="ascii")          # tampered list: refused
+    assert main(["extract-cohort", "--config", str(cfg_path), "--splits", "dev"]) == 2

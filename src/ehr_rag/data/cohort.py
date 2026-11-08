@@ -24,6 +24,15 @@ Selection, as implemented (each step's count is printed):
  10. eligible subjects shuffled with ``random.Random(f"{seed}:draw")``; the first
      ``n_dev`` give the dev admissions, the next ``n_test`` the test admissions, so
      dev and test never share a patient.
+
+Extraction (``extract-cohort``) copies, for the patients of the selected admissions,
+every row of each table ``build-units`` loads (all their admissions, so prior
+admissions and time-window lab linkage work as before), plus the three dictionary
+tables in full. Rows are filtered inside DuckDB while scanning the csv.gz files, so
+nothing large is loaded into memory. Columns are exactly the Demo's columns, in the
+Demo's order, all as strings; ``build-units`` then reads the Parquet unchanged.
+The discharge notes of the selected admissions go to a separate ``reference/``
+directory: they are evaluation references and never evidence.
 """
 
 from __future__ import annotations
@@ -37,10 +46,25 @@ from typing import Any, Callable
 import pandas as pd
 
 from ehr_rag.config import ConfigError, project_root, resolve_path
-from ehr_rag.data.load import SchemaError, find_table_files
+from ehr_rag.data.load import EXPECTED_COLUMNS, EXTRA_COLUMNS, SchemaError, find_table_files, read_header
 
 SPLITS: tuple[str, ...] = ("dev", "test")
 NOTE_TABLE = "discharge"
+NOTE_COLUMNS: tuple[str, ...] = ("note_id", "subject_id", "hadm_id", "note_seq", "text")
+DICTIONARY_TABLES: tuple[str, ...] = ("d_labitems", "d_icd_diagnoses", "d_icd_procedures")
+# Row order of the extracted files (numeric keys compared as integers).
+ORDER_BY: dict[str, tuple[str, ...]] = {
+    "patients": ("subject_id",),
+    "admissions": ("subject_id", "hadm_id"),
+    "labevents": ("labevent_id",),
+    "d_labitems": ("itemid",),
+    "prescriptions": ("subject_id", "hadm_id", "pharmacy_id"),
+    "diagnoses_icd": ("subject_id", "hadm_id", "seq_num"),
+    "d_icd_diagnoses": ("icd_code", "icd_version"),
+    "procedures_icd": ("subject_id", "hadm_id", "seq_num"),
+    "d_icd_procedures": ("icd_code", "icd_version"),
+}
+_TEXT_KEYS = {"icd_code"}
 
 
 class CohortError(RuntimeError):
@@ -58,6 +82,16 @@ def cohort_dir(cfg: dict[str, Any]) -> Path:
 def hash_dir(cfg: dict[str, Any]) -> Path:
     """Committed directory holding only the SHA-256 hashes of the id lists."""
     return project_root(cfg) / "config" / "cohort"
+
+
+def evidence_root(cfg: dict[str, Any]) -> Path:
+    """Extracted structured tables (``<out_dir>/evidence/hosp/*.parquet``): ``data.root`` of config/full.yaml."""
+    return cohort_dir(cfg) / "evidence"
+
+
+def reference_dir(cfg: dict[str, Any]) -> Path:
+    """Discharge notes of the selected admissions (evaluation references only, never evidence)."""
+    return cohort_dir(cfg) / "reference"
 
 
 def ids_path(cfg: dict[str, Any], split: str) -> Path:
@@ -259,3 +293,157 @@ def select_cohort(
     step("dev admissions", len(dev))
     step("test admissions", len(test))
     return CohortSelection(splits={"dev": dev, "test": test}, counts=counts)
+
+
+# --------------------------------------------------------------------------- schema check
+
+
+def schema_report(full_root: Path, demo_root: Path, extracted_root: Path | None,
+                  note_file: Path | None) -> dict[str, dict[str, Any]]:
+    """Column differences per table between full MIMIC-IV, the Demo and (if given) the extracted Parquet.
+
+    Reads headers only. Per table: ``demo_not_in_full`` (blocks extraction),
+    ``full_not_in_demo`` (dropped by extraction), ``builder_not_in_full`` (columns
+    ``build-units`` loads that are missing) and, when extracted files exist,
+    ``extracted_differs`` (their columns are not exactly the Demo's, in order).
+    For the note table: ``required_not_in_full`` and its ``columns``.
+    """
+    full, demo = find_table_files(full_root), find_table_files(demo_root)
+    extracted = find_table_files(extracted_root) if extracted_root is not None else {}
+    out: dict[str, dict[str, Any]] = {}
+    for t in EXPECTED_COLUMNS:
+        f, d = read_header(full[t]), read_header(demo[t])
+        builder = EXPECTED_COLUMNS[t] + EXTRA_COLUMNS.get(t, [])
+        r: dict[str, Any] = {
+            "demo_not_in_full": [c for c in d if c not in f],
+            "full_not_in_demo": [c for c in f if c not in d],
+            "builder_not_in_full": [c for c in builder if c not in f],
+        }
+        if t in extracted:
+            r["extracted_differs"] = read_header(extracted[t]) != d
+        out[t] = r
+    if note_file is not None:
+        h = read_header(note_file)
+        out[NOTE_TABLE] = {"required_not_in_full": [c for c in NOTE_COLUMNS if c not in h], "columns": h}
+    return out
+
+
+def schema_ok(report: dict[str, dict[str, Any]]) -> bool:
+    """True if extraction keeps every Demo column and the builder finds every column it loads."""
+    return not any(r.get("demo_not_in_full") or r.get("builder_not_in_full") or r.get("required_not_in_full")
+                   or r.get("extracted_differs") for r in report.values())
+
+
+# --------------------------------------------------------------------------- extraction
+
+
+def _order_sql(table: str) -> str:
+    keys = ORDER_BY[table]
+    return ", ".join(k if k in _TEXT_KEYS else f"TRY_CAST({k} AS BIGINT), {k}" for k in keys)
+
+
+def _cols_sql(cols: list[str]) -> str:
+    return ", ".join('"' + c.replace('"', '""') + '"' for c in cols)
+
+
+def _copy_parquet(con: Any, select_sql: str, dest: Path) -> int:
+    """``COPY`` a query to Parquet (written to a temp name, then renamed). Returns the row count."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    con.execute(f"COPY ({select_sql}) TO {_q(tmp)} (FORMAT parquet, COMPRESSION zstd)")
+    tmp.replace(dest)
+    return int(con.execute(f"SELECT COUNT(*) FROM read_parquet({_q(dest)})").fetchone()[0])
+
+
+def extract_cohort(
+    full_root: Path,
+    demo_root: Path,
+    hadm_ids: list[int],
+    evidence_out: Path,
+    note_file: Path | None,
+    reference_out: Path,
+    log: Callable[[str], None] = print,
+) -> dict[str, Any]:
+    """Copy the cohort's rows into Parquet (see module docstring). Logs counts only.
+
+    ``note_file=None`` skips the reference notes. Raises SchemaError if a Demo column
+    is missing from the full data, CohortError if a selected admission is not in the
+    full ``admissions`` table.
+    """
+    full, demo = find_table_files(full_root), find_table_files(demo_root)
+    columns = {t: read_header(demo[t]) for t in EXPECTED_COLUMNS}
+    missing = {t: [c for c in columns[t] if c not in read_header(full[t])] for t in EXPECTED_COLUMNS}
+    missing = {t: m for t, m in missing.items() if m}
+    if missing:
+        raise SchemaError(f"Demo columns missing from the full data (see cohort-schema-check): {missing}")
+    con = connect()
+    target = sorted(set(hadm_ids))
+    con.execute("CREATE TEMP TABLE target AS SELECT UNNEST(?::BIGINT[]) AS hadm_id", [target])
+    con.execute(f"""
+        CREATE TEMP TABLE subj AS
+        SELECT DISTINCT TRY_CAST(subject_id AS BIGINT) AS subject_id, TRY_CAST(hadm_id AS BIGINT) AS hadm_id
+        FROM {read_csv_sql(full['admissions'])}
+        WHERE TRY_CAST(hadm_id AS BIGINT) IN (SELECT hadm_id FROM target)""")
+    n_found = con.execute("SELECT COUNT(DISTINCT hadm_id) FROM subj").fetchone()[0]
+    if n_found != len(target):
+        raise CohortError(f"{len(target) - n_found} of {len(target)} selected admissions are not in admissions")
+    n_subj = int(con.execute("SELECT COUNT(DISTINCT subject_id) FROM subj").fetchone()[0])
+    log(f"  {'selected admissions':<44} {len(target):>12,}")
+    log(f"  {'their patients':<44} {n_subj:>12,}")
+    counts: dict[str, int] = {}
+    for t in EXPECTED_COLUMNS:
+        if t in DICTIONARY_TABLES:
+            where = ""
+        else:
+            where = "WHERE TRY_CAST(subject_id AS BIGINT) IN (SELECT subject_id FROM subj)"
+        sql = f"SELECT {_cols_sql(columns[t])} FROM {read_csv_sql(full[t])} {where} ORDER BY {_order_sql(t)}"
+        counts[t] = _copy_parquet(con, sql, evidence_out / "hosp" / f"{t}.parquet")
+        label = t + (" (all rows)" if t in DICTIONARY_TABLES else "")
+        log(f"  {label:<44} {counts[t]:>12,} rows")
+    notes: dict[str, int] = {}
+    if note_file is None:
+        log("  (discharge notes skipped)")
+    else:
+        h = read_header(note_file)
+        lacking = [c for c in NOTE_COLUMNS if c not in h]
+        if lacking:
+            raise SchemaError(f"{note_file.name}: missing column(s) {lacking}")
+        dest = reference_out / f"{NOTE_TABLE}.parquet"
+        sql = (f"SELECT {_cols_sql(h)} FROM {read_csv_sql(note_file)} "
+               "WHERE TRY_CAST(hadm_id AS BIGINT) IN (SELECT hadm_id FROM target) "
+               "ORDER BY TRY_CAST(hadm_id AS BIGINT), TRY_CAST(note_seq AS BIGINT), note_id")
+        notes["note rows"] = _copy_parquet(con, sql, dest)
+        per = [k for (k,) in con.execute(f"""
+            SELECT COUNT(n.h) FROM target t
+            LEFT JOIN (SELECT TRY_CAST(hadm_id AS BIGINT) AS h FROM read_parquet({_q(dest)})) n ON n.h = t.hadm_id
+            GROUP BY t.hadm_id""").fetchall()]
+        notes["admissions without a note"] = sum(1 for k in per if k == 0)
+        notes["admissions with one note"] = sum(1 for k in per if k == 1)
+        notes["admissions with several notes"] = sum(1 for k in per if k > 1)
+        notes["references written"] = write_references(con, dest, reference_out / "references.csv")
+        for k, v in notes.items():
+            log(f"  {'discharge: ' + k:<44} {v:>12,}")
+    con.close()
+    return {"n_admissions": len(target), "n_subjects": n_subj, "rows": counts, "notes": notes}
+
+
+def write_references(con: Any, notes_parquet: Path, dest: Path) -> int:
+    """``references.csv`` (``hadm_id,reference``: the ``text-metrics`` format) from the extracted notes.
+
+    Several notes of one admission are joined by a blank line in ``note_seq`` order.
+    Returns the number of admissions written.
+    """
+    import csv
+
+    rows = con.execute(f"""
+        SELECT TRY_CAST(hadm_id AS BIGINT) AS h,
+               string_agg(text, chr(10) || chr(10) ORDER BY TRY_CAST(note_seq AS BIGINT), note_id)
+        FROM read_parquet({_q(notes_parquet)})
+        WHERE text IS NOT NULL GROUP BY h ORDER BY h""").fetchall()
+    tmp = dest.with_name(dest.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["hadm_id", "reference"])
+        w.writerows(rows)
+    tmp.replace(dest)
+    return len(rows)

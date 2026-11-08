@@ -71,6 +71,8 @@ Every command that produces results writes `runs/<YYYYMMDD-HHMMSS-name>/`, conta
 | 1 | `inspect-data` | CPU | data tree, header check vs SPEC, 5 rows per table, row counts, lab linkage |
 | 2 | `select-admissions` | CPU | admission metrics, `data/derived/admission_candidates.csv`, proposed `config/selected_admissions.yaml` (edit by hand) |
 | 2a | `select-cohort [--skip-note-filter]` | CPU | full MIMIC-IV (DuckDB over csv.gz): seeded dev/test cohort; prints counts only; id lists in `cohort.out_dir` (gitignored), SHA-256 hashes in `config/cohort/*.sha256` |
+| 2b | `extract-cohort [--splits dev test]` | CPU | copy the cohort patients' rows of the 9 builder tables (Demo columns, as strings) into `<cohort.out_dir>/evidence/hosp/*.parquet`, filtering in DuckDB; their discharge notes into `<cohort.out_dir>/reference/` (`discharge.parquet`, `references.csv`); counts only |
+| 2c | `cohort-schema-check` | CPU | headers only: columns that differ between full MIMIC-IV, the Demo and the extracted Parquet; exit 3 if a Demo or builder column is missing |
 | 3 | `build-units` | CPU | evidence units + headers: `data/derived/units/<hadm_id>.jsonl`, `<hadm_id>_header.json` |
 | 4 | `retrieve` | CPU/GPU | BM25 + MedCPT dense + RRF per section; `retrieval/<hadm_id>.json` incl. the ordered `evidence_units` used by `generate` |
 | 5 | `export-relevance` | CPU/GPU | `relevance_to_label.csv`: pooled top-10 (BM25, dense, fused) for manual labeling |

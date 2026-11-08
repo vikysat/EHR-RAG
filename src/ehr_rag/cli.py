@@ -145,6 +145,70 @@ def cmd_select_cohort(args: argparse.Namespace) -> int:
     return 0
 
 
+def _split_ids(cfg: dict, splits: list[str]) -> list[int]:
+    """Admission ids of the given cohort splits, each checked against its committed hash."""
+    from ehr_rag.data.cohort import load_split_ids
+
+    ids: list[int] = []
+    for s in dict.fromkeys(splits):
+        ids.extend(h for h in load_split_ids(cfg, s) if h not in ids)
+    return ids
+
+
+def cmd_extract_cohort(args: argparse.Namespace) -> int:
+    """Copy the cohort's rows from full MIMIC-IV into Parquet; prints counts only."""
+    from ehr_rag.config import resolve_path
+    from ehr_rag.data.cohort import CohortError, evidence_root, extract_cohort, find_note_file, reference_dir
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    co = cfg["cohort"]
+    ids = _split_ids(cfg, args.splits)
+    note_file = None if args.skip_notes else find_note_file(resolve_path(cfg, co["note_root"]))
+    run = start_run(cfg, "extract-cohort", command="extract-cohort")
+    print(f"== Cohort extraction, splits {args.splits} (counts only)")
+    try:
+        res = extract_cohort(resolve_path(cfg, co["mimic_root"]), resolve_path(cfg, co["demo_root"]), ids,
+                             evidence_root(cfg), note_file, reference_dir(cfg))
+    except CohortError as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        run.finish(status="failed", error=str(e))
+        return 4
+    print(f"\nwrote {evidence_root(cfg)} (data.root for build-units)")
+    if note_file is not None:
+        print(f"wrote {reference_dir(cfg)} (evaluation references only; never evidence)")
+    run.finish(splits=args.splits, **res)
+    print(f"run: {run.path}")
+    return 0
+
+
+def cmd_cohort_schema_check(args: argparse.Namespace) -> int:
+    """Column differences: full MIMIC-IV vs the Demo (and the extracted Parquet, if present)."""
+    from ehr_rag.config import resolve_path
+    from ehr_rag.data.cohort import evidence_root, find_note_file, schema_ok, schema_report
+
+    cfg = load_config(args.config)
+    co = cfg["cohort"]
+    ext = evidence_root(cfg)
+    ext_root = ext if (ext / "hosp").is_dir() else None
+    note_file = None if args.skip_notes else find_note_file(resolve_path(cfg, co["note_root"]))
+    rep = schema_report(resolve_path(cfg, co["mimic_root"]), resolve_path(cfg, co["demo_root"]), ext_root, note_file)
+    print("== Column check: full MIMIC-IV vs the Demo (headers only)")
+    for t, r in rep.items():
+        print(f"\n{t}")
+        for k, v in r.items():
+            if k == "extracted_differs":
+                v = "DIFFERENT from the Demo" if v else "same as the Demo"
+                k = "extracted Parquet columns"
+            print(f"  {k:<26} {v if v != [] else '-'}")
+    if ext_root is None:
+        print(f"\n(no extracted Parquet under {ext}; run extract-cohort to include it)")
+    ok = schema_ok(rep)
+    print("\nOK: every Demo column and every builder column exists in the full data" if ok
+          else "\nSTOP: schema differences block extraction or build-units (see above)")
+    return 0 if ok else 3
+
+
 def _selected_ids(cfg: dict) -> list[int]:
     from ehr_rag.config import project_root
     from ehr_rag.data.select_admissions import load_selected_hadm_ids
@@ -654,6 +718,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-dev", type=int, help="override cohort.n_dev")
     p.add_argument("--n-test", type=int, help="override cohort.n_test")
     p.add_argument("--overwrite", action="store_true", help="replace existing id lists and hashes")
+    p = add("extract-cohort", cmd_extract_cohort,
+            "Full MIMIC-IV: copy the cohort's rows (Demo columns) into Parquet, plus reference discharge notes.")
+    p.add_argument("--splits", nargs="+", default=["dev", "test"], choices=["dev", "test"],
+                   help="cohort splits to extract (default: dev test)")
+    p.add_argument("--skip-notes", action="store_true", help="do not extract discharge notes (the Demo has none)")
+    p = add("cohort-schema-check", cmd_cohort_schema_check,
+            "Column differences between full MIMIC-IV, the Demo and the extracted Parquet (headers only).")
+    p.add_argument("--skip-notes", action="store_true", help="do not check the MIMIC-IV-Note discharge table")
     add("build-units", cmd_build_units,
         "Phase 2: build evidence units and headers for admissions in config/selected_admissions.yaml.")
     p = add("retrieve", cmd_retrieve, "Phase 3: per-section hybrid retrieval for the selected admissions.")

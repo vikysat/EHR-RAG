@@ -143,3 +143,14 @@ better than it is, never guesses, and keeps the raw data for manual review.
   replace existing hashes without `--overwrite`.
 - **Testing on the Demo** needs `--skip-note-filter` (no notes) and
   `--no-demo-exclusion` (otherwise nothing is left).
+- **Extraction scope:** every row of the cohort's PATIENTS (not only the target
+  admissions) for patients, admissions, labevents, prescriptions, diagnoses_icd and
+  procedures_icd, because history units and time-window lab linkage need the other
+  admissions. Dictionary tables are copied in full. Columns are exactly the Demo's,
+  in the Demo's order, stored as strings, so `build-units` gives byte-identical units
+  from the Parquet and from the CSV (tested on fake data and on the Demo). Columns
+  that only the newer full release has are dropped; a Demo column missing from the
+  full data stops extraction.
+- **Reference notes:** only the target admissions' discharge notes are extracted, to
+  `reference/`, never to the evidence root. Several notes of one admission are joined
+  by a blank line in `note_seq` order in `references.csv`.

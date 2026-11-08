@@ -1,5 +1,8 @@
 """Locate, schema-check and load the MIMIC-IV tables used by this project.
 
+Tables are ``<module>/<table>.csv.gz``, ``.csv`` or ``.parquet`` (the latter written
+by ``extract-cohort`` with every column as a string, so both formats load the same).
+
 All identifier/code columns are read as strings first (ICD codes have leading
 zeros) and only the documented numeric keys are converted. Lab ``value``,
 ``valuenum`` and reference-range columns are kept as their original strings so
@@ -18,6 +21,7 @@ import pandas as pd
 from ehr_rag.config import resolve_path
 
 MODULE_DIRS: tuple[str, ...] = ("hosp", "core")
+TABLE_EXTS: tuple[str, ...] = (".csv.gz", ".csv", ".parquet")
 
 EXPECTED_COLUMNS: dict[str, list[str]] = {
     "patients": ["subject_id", "gender", "anchor_age", "anchor_year"],
@@ -110,7 +114,7 @@ def directory_tree(root: Path) -> list[str]:
 
 
 def find_table_files(root: Path) -> dict[str, Path]:
-    """Find ``<table>.csv.gz`` or ``<table>.csv`` under one of ``MODULE_DIRS``.
+    """Find ``<table>`` + one of ``TABLE_EXTS`` under one of ``MODULE_DIRS``.
 
     Raises SchemaError if a table is missing or found in more than one place.
     """
@@ -122,7 +126,7 @@ def find_table_files(root: Path) -> dict[str, Path]:
         hits = [
             root / mod / f"{table}{ext}"
             for mod in MODULE_DIRS
-            for ext in (".csv.gz", ".csv")
+            for ext in TABLE_EXTS
             if (root / mod / f"{table}{ext}").is_file()
         ]
         if not hits:
@@ -136,8 +140,16 @@ def find_table_files(root: Path) -> dict[str, Path]:
     return found
 
 
+def _is_parquet(path: Path) -> bool:
+    return path.suffix == ".parquet"
+
+
 def read_header(path: Path) -> list[str]:
-    """Read only the header row of a CSV(.gz)."""
+    """Column names only: the header row of a CSV(.gz), or the schema of a Parquet file."""
+    if _is_parquet(path):
+        import pyarrow.parquet as pq
+
+        return list(pq.read_schema(path).names)
     return list(pd.read_csv(path, nrows=0).columns)
 
 
@@ -159,12 +171,21 @@ def check_columns(files: dict[str, Path]) -> dict[str, dict[str, list[str]]]:
 
 def head_rows(path: Path, n: int = 5) -> pd.DataFrame:
     """First ``n`` rows, all as strings."""
+    if _is_parquet(path):
+        import pyarrow.parquet as pq
+
+        batch = next(pq.ParquetFile(path).iter_batches(batch_size=n), None)
+        df = batch.to_pandas() if batch is not None else pd.DataFrame(columns=read_header(path))
+        return df.astype(object).where(df.notna(), "").astype(str)
     return pd.read_csv(path, nrows=n, dtype=str, keep_default_na=False)
 
 
 def _read_table(table: str, path: Path) -> pd.DataFrame:
     cols = EXPECTED_COLUMNS[table] + EXTRA_COLUMNS.get(table, [])
-    df = pd.read_csv(path, usecols=cols, dtype=str, keep_default_na=False, na_values=[""])
+    if _is_parquet(path):
+        df = pd.read_parquet(path, columns=cols).astype(str)  # pandas 3: nulls stay NaN, as in read_csv
+    else:
+        df = pd.read_csv(path, usecols=cols, dtype=str, keep_default_na=False, na_values=[""])
     df = df[cols]
     for c in _INT_COLUMNS.get(table, []):
         df[c] = pd.to_numeric(df[c], errors="raise").astype("Int64")
