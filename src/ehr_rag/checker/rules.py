@@ -354,14 +354,18 @@ class Checker:
         """Every non-abstention line of the four sections."""
         return [self.check_line(s, ctx) for s in parsed.sentences() if not s.is_abstention]
 
-    def check_line(self, s: Sentence, ctx: "AdmissionContext") -> LineCheck:
-        """Check one parsed line (split into items for list sentences)."""
+    def items(self, s: Sentence, ctx: "AdmissionContext") -> list[tuple[str, list[str]]]:
+        """The claims of one line as (text, evidence ids); list items get the list's opening words."""
         claims = split_claims(s)
         if len(claims) > 1:
             first = claims[0][0]
             lead = first[: self._content_start(first, ctx)].strip()
             claims = [claims[0]] + [((f"{lead} {t}" if lead else t), ids) for t, ids in claims[1:]]
-        items = [self._check_item(t, [i for i in ids if i != "NONE"], ctx) for t, ids in claims]
+        return [(t, [i for i in ids if i != "NONE"]) for t, ids in claims]
+
+    def check_line(self, s: Sentence, ctx: "AdmissionContext") -> LineCheck:
+        """Check one parsed line (split into items for list sentences)."""
+        items = [self._check_item(t, ids, ctx) for t, ids in self.items(s, ctx)]
         return LineCheck(s.section, s.index, s.raw.strip(), s.text, list(s.citations), items)
 
     def _content_start(self, text: str, ctx: "AdmissionContext") -> int:
@@ -487,13 +491,16 @@ class Checker:
         """True if any stated number matches this unit value (equal or rounded)."""
         return any(self.number_matches(s, [value]) for s in stated)
 
-    def _check_directions(self, text: str, mentions: list[Mention], supported: dict[int, str],
-                          cited: list[EvidenceUnit], stated: list[Decimal], it: ItemCheck,
-                          ctx: "AdmissionContext") -> None:
+    def direction_claims(self, text: str, mentions: list[Mention]) -> list[tuple[int, Mention, str, bool, str]]:
+        """Direction claims in ``text``: (mention index, mention, high|low|normal, negated, word).
+
+        A direction word is attached to the nearest lab name within ``direction.window_tokens``;
+        every lab-derived term is a claim of its own direction.
+        """
         _, tok = self._token_index(text)
         labs = [(k, m) for k, m in enumerate(mentions) if m.kind == "lab"]
         spans = [(m.start, m.end) for m in mentions]
-        claims: list[tuple[int, Mention, str, bool, str]] = []   # (mention index, mention, direction, negated, word)
+        claims: list[tuple[int, Mention, str, bool, str]] = []
         for direction, rx in self.dir_words.items():
             for w in rx.finditer(text):
                 if any(a <= w.start() < b for a, b in spans):
@@ -504,8 +511,19 @@ class Checker:
                     anchors = [tok(w.start()), tok(m.start)]
                     claims.append((k, m, direction, self._negated(text, anchors, tok), w.group(0)))
         for k, m in enumerate(mentions):
-            if m.kind == "term" and supported.get(k) == "lab":
+            if m.kind == "term":
                 claims.append((k, m, m.term["direction"], self._negated(text, [tok(m.start)], tok), m.surface))
+        return claims
+
+    def direction_holds(self, units: list[EvidenceUnit], direction: str, stated: list[Decimal]) -> bool | None:
+        """Whether ``direction`` (high/low/normal) holds for these lab units; None if not checkable."""
+        return self._direction_holds(units, direction, stated)
+
+    def _check_directions(self, text: str, mentions: list[Mention], supported: dict[int, str],
+                          cited: list[EvidenceUnit], stated: list[Decimal], it: ItemCheck,
+                          ctx: "AdmissionContext") -> None:
+        claims = [c for c in self.direction_claims(text, mentions)
+                  if c[1].kind != "term" or supported.get(c[0]) == "lab"]
         for k, m, direction, negated, word in claims:
             if k not in supported:
                 continue                                  # name_missing already reported

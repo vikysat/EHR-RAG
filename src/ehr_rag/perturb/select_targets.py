@@ -169,3 +169,97 @@ def select_targets(
         c.target_id = f"T{i:02d}"
     return chosen
 
+
+
+# --------------------------------------------------------------------------- counterfactual audit targets
+#
+# Audit targets (``audit-targets``), per admission, from the plain ehr_rag report:
+#   cited  up to ``audit.n_cited_per_admission`` numeric lab units of the evidence shown that
+#          the report cites (any claim, list items included), units with a [HIGH]/[LOW]
+#          point first, each group in an order shuffled with ``random.Random(f"{seed}:{hadm}:cited")``
+#   null   up to ``audit.n_null_per_admission`` shown numeric lab units cited NOWHERE in the
+#          report, shuffled with ``f"{seed}:{hadm}:null"``
+# Units without a two-sided reference range, and units the edit cannot be applied to, are
+# skipped and counted with their reason; the next unit in the order is tried instead.
+
+AUDIT_KINDS: tuple[str, ...] = ("cited", "null")
+
+
+@dataclass
+class AuditTarget:
+    """One lab unit to edit."""
+
+    hadm_id: int
+    unit_id: str
+    label: str
+    kind: str                # cited | null
+    status: str              # high | low | mixed | normal (shown points' markers)
+    n_citing_claims: int
+    target_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def lab_status(fields: dict[str, Any]) -> str:
+    """high / low / mixed / normal from the [HIGH]/[LOW] markers of the shown points."""
+    from ehr_rag.evidence.render import lab_marker
+
+    marks = {lab_marker(fields[p]["value"], fields[p].get("flag"), fields.get("ref_low"), fields.get("ref_high"))
+             for p in LAB_POINTS if fields.get(p)}
+    hi, lo = "[HIGH]" in marks, "[LOW]" in marks
+    return "mixed" if hi and lo else "high" if hi else "low" if lo else "normal"
+
+
+def range_skip_reason(unit: Any) -> str:
+    """Why a lab unit cannot be an audit target ('' if it can)."""
+    from ehr_rag.evidence.render import effective_ref
+
+    f = unit.fields
+    if unit.unit_type != "lab" or not f.get("numeric"):
+        return "not a numeric lab"
+    lo, hi = effective_ref(f.get("ref_low"), f.get("ref_high"))
+    if lo is None and hi is None:
+        return "no reference range"
+    if lo is None or hi is None:
+        return "one-sided reference range"
+    return ""
+
+
+def select_audit_targets(
+    hadm_id: int, shown: list[Any], cited: dict[str, int], n_cited: int, n_null: int, seed: int,
+    editable: Any = None,
+) -> tuple[list[AuditTarget], list[dict[str, Any]]]:
+    """Targets and skip log for one admission. ``cited`` maps unit id -> number of citing claims;
+    ``editable(unit) -> reason`` ('' if the edit applies) lets the caller reject a unit."""
+    labs = [u for u in shown if u.unit_type == "lab"]
+    skips: list[dict[str, Any]] = []
+    ok: list[Any] = []
+    for u in labs:
+        reason = range_skip_reason(u)
+        if reason:
+            skips.append({"hadm_id": hadm_id, "unit_id": u.unit_id, "kind": "cited" if u.unit_id in cited else "null",
+                          "reason": reason})
+        else:
+            ok.append(u)
+    cited_units = [u for u in ok if u.unit_id in cited]
+    flagged = [u for u in cited_units if lab_status(u.fields) != "normal"]
+    normal = [u for u in cited_units if lab_status(u.fields) == "normal"]
+    for group in (flagged, normal):
+        random.Random(f"{seed}:{hadm_id}:cited").shuffle(group)
+    nulls = [u for u in ok if u.unit_id not in cited]
+    random.Random(f"{seed}:{hadm_id}:null").shuffle(nulls)
+    out: list[AuditTarget] = []
+    for kind, order, cap in (("cited", flagged + normal, n_cited), ("null", nulls, n_null)):
+        taken = 0
+        for u in order:
+            if taken >= cap:
+                break
+            reason = editable(u) if editable else ""
+            if reason:
+                skips.append({"hadm_id": hadm_id, "unit_id": u.unit_id, "kind": kind, "reason": reason})
+                continue
+            out.append(AuditTarget(hadm_id, u.unit_id, str(u.fields["label"]), kind, lab_status(u.fields),
+                                   cited.get(u.unit_id, 0)))
+            taken += 1
+    return out, skips

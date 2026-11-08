@@ -98,6 +98,15 @@ SCHEMA: dict[str, Any] = {
     "eval": {"nli_model": _STR, "manual_review_n": _INT, "seed": _INT, "bertscore_model": _STR,
              "bertscore_layer": _INT},
     "checker": {"rules": _STR, "lexicon": _STR, "rewrite_prompt": _STR},
+    "audit": {
+        "n_cited_per_admission": _INT,
+        "n_null_per_admission": _INT,
+        "seed": _INT,
+        "outside_fraction": _NUM,
+        "below_range_groups": _LIST,
+        "bootstrap_resamples": _INT,
+        "manual_check_n": _INT,
+    },
     "perturbation": {
         "n_targets": _INT,
         "max_targets_per_admission": _INT,
@@ -171,6 +180,12 @@ def validate_config(cfg: dict[str, Any]) -> None:
     for key in ("top_k_per_query", "max_units_per_section", "max_units_total", "rrf_k"):
         if cfg["retrieval"][key] < 1:
             raise ConfigError(f"retrieval.{key}: must be >= 1")
+    au = cfg["audit"]
+    if au["outside_fraction"] <= 0:
+        raise ConfigError("audit.outside_fraction: must be > 0")
+    for key in ("n_cited_per_admission", "n_null_per_admission", "bootstrap_resamples", "manual_check_n"):
+        if au[key] < 0:
+            raise ConfigError(f"audit.{key}: must be >= 0")
     co = cfg["cohort"]
     if not 0 < co["pool_fraction"] <= 1:
         raise ConfigError("cohort.pool_fraction: must be in (0, 1]")

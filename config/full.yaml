@@ -82,6 +82,18 @@ checker:                       # citation checker + enforcement; frozen, hashes 
   lexicon: config/checker_lexicon.yaml
   rewrite_prompt: rewrite_v1   # prompts/rewrite_v1.txt (one-sentence rewrite)
 
+audit:                         # counterfactual citation audit: audit-targets / run-audit / analyze-audit
+  n_cited_per_admission: 3     # lab units cited in the plain ehr_rag report; HIGH/LOW-flagged first
+  n_null_per_admission: 1      # a shown lab unit cited nowhere in the report (null edit)
+  seed: 13
+  # flagged unit -> every measurement to the midpoint of the reference range;
+  # normal unit -> every measurement to bound +/- outside_fraction * (ref_high - ref_low):
+  # above ref_high, or below ref_low for these lab groups (checker lexicon keys)
+  outside_fraction: 0.5
+  below_range_groups: [hemoglobin, hematocrit, platelet, albumin]
+  bootstrap_resamples: 1000    # faithfulness CIs, resampling admissions
+  manual_check_n: 50
+
 perturbation:
   n_targets: 15
   max_targets_per_admission: 2
