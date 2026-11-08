@@ -9,7 +9,10 @@ As implemented:
   - Each non-blank line inside a section is one sentence.
   - Only the TRAILING citation group counts as the sentence's citations. It is one or
     more bracket groups at the end of the line: ``[E3]``, ``[E3, E7]``, ``[E3][E7]``,
-    ``[NONE]``. Ids are de-duplicated in order of appearance.
+    ``[NONE]``, optionally followed by one period (``Fact [E3].``). Ids are
+    de-duplicated in order of appearance. A period after the citations is moved to
+    the sentence text when the text does not already end in ``.``/``!``/``?``, and
+    the line is flagged ``period_after_citation``.
   - Citation-like brackets elsewhere in the line are removed from the stored sentence
     text, recorded in ``mid_citations`` and flagged ``mid_sentence_citation``; they
     do NOT count as citations.
@@ -17,6 +20,14 @@ As implemented:
     boundary: ``.``, ``!`` or ``?`` followed by whitespace and an uppercase letter
     (decimals such as ``5.9`` are not boundaries).
   - ``Insufficient evidence. [NONE]`` (exact text, [NONE] only) is an abstention line.
+
+Claims (``split_claims``, used by the citation metrics): a line with citation groups
+inside it, such as a list ``Na 130 [E1], K 5.9 [E2], and Cr 2.1 [E3].``, is split
+into one claim per citation run (adjacent groups form one run), each with its own
+ids: ``Na 130`` [E1], ``K 5.9`` [E2], ``Cr 2.1`` [E3]. Leading ``,;:`` and a
+leading ``and``/``or`` are removed from each claim; text after the last citation
+run (other than punctuation) is an uncited claim. A line without inside citations
+is a single claim, unchanged.
 """
 
 from __future__ import annotations
@@ -29,7 +40,7 @@ from ehr_rag.config import SECTIONS
 
 _HEADER_LINES = {f"### {s}": s for s in SECTIONS}
 _CITE_GROUP = r"\[\s*(?:NONE|E\d+(?:\s*,\s*E\d+)*)\s*\]"
-TRAILING_RE = re.compile(rf"(?:\s*{_CITE_GROUP})+\s*$")
+TRAILING_RE = re.compile(rf"(?:\s*{_CITE_GROUP})+\s*\.?\s*$")
 CITE_GROUP_RE = re.compile(_CITE_GROUP)
 CITE_ID_RE = re.compile(r"E\d+|NONE")
 _BOUNDARY_RE = re.compile(r"[.!?]\s+[A-Z]")
@@ -100,6 +111,50 @@ def _dedupe(ids: list[str]) -> list[str]:
     return [i for i in ids if not (i in seen or seen.add(i))]
 
 
+def _tidy(text: str) -> str:
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return re.sub(r"\s+([.,;:!?])", r"\1", text)
+
+
+_LEAD_RE = re.compile(r"^(?:[,;:]\s*|(?:and|or)\s+)+", re.IGNORECASE)
+
+
+def _claim_text(segment: str) -> str:
+    return _LEAD_RE.sub("", _tidy(segment)).rstrip(",;: ").strip()
+
+
+def split_claims(s: Sentence) -> list[tuple[str, list[str]]]:
+    """Claims of one line as (text, citation ids); see the module docstring."""
+    if not s.mid_citations:
+        return [(s.text, list(s.citations))]
+    line = s.raw.strip()
+    runs: list[list[Any]] = []          # [start, end, ids] of adjacent citation groups
+    for m in CITE_GROUP_RE.finditer(line):
+        ids = CITE_ID_RE.findall(m.group(0))
+        if runs and not line[runs[-1][1]: m.start()].strip():
+            runs[-1][1] = m.end()
+            runs[-1][2].extend(ids)
+        else:
+            runs.append([m.start(), m.end(), ids])
+    claims: list[tuple[str, list[str]]] = []
+    carry: list[str] = []               # ids of a run with no text before it go to the next claim
+    pos = 0
+    for start, end, ids in runs:
+        text = _claim_text(line[pos:start])
+        pos = end
+        if text:
+            claims.append((text, _dedupe(carry + ids)))
+            carry = []
+        else:
+            carry.extend(ids)
+    tail = _claim_text(line[pos:])
+    if tail.strip(".!? "):
+        claims.append((tail, _dedupe(carry)))
+    elif carry and claims:
+        claims[-1] = (claims[-1][0], _dedupe(claims[-1][1] + carry))
+    return claims
+
+
 def parse_line(raw: str, section: str, index: int, line_no: int) -> Sentence:
     """Parse one sentence line."""
     line = raw.strip()
@@ -107,9 +162,12 @@ def parse_line(raw: str, section: str, index: int, line_no: int) -> Sentence:
     citations = _dedupe(CITE_ID_RE.findall(m.group(0))) if m else []
     body = line[: m.start()] if m else line
     mids = [i for g in CITE_GROUP_RE.findall(body) for i in CITE_ID_RE.findall(g)]
-    text = re.sub(r"\s{2,}", " ", CITE_GROUP_RE.sub("", body)).strip()
-    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+    text = _tidy(CITE_GROUP_RE.sub("", body))
     flags: list[str] = []
+    if m and m.group(0).rstrip().endswith("."):
+        flags.append("period_after_citation")
+        if text and text[-1] not in ".!?":
+            text += "."
     if not citations:
         flags.append("no_trailing_citation")
     if mids:

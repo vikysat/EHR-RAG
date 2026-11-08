@@ -24,18 +24,30 @@ better than it is, never guesses, and keeps the raw data for manual review.
 
 - **Abstention lines** (`Insufficient evidence. [NONE]`) are excluded from every rate
   and counted as `n_abstentions`, so they neither inflate nor deflate the rates.
-- **Only the trailing citation group counts.** Citations in the middle of a line are
-  flagged (`mid_sentence_citation`) but do not count, so such a sentence may be uncited.
-- **Duplicate ids within one sentence** are counted once.
+- **Claims (revised).** Originally only the trailing citation group counted and
+  citations inside a line were ignored. Now a line with inside citations (a list) is
+  split into one claim per citation run before scoring, each with only its own ids;
+  all rates are over claims. Leading `,;:`/`and`/`or` are removed from each claim; a
+  claim is not given the list's lead-in words (`Labs: Na 130 [E1], K 5.9 [E2]` →
+  `Labs: Na 130`, `K 5.9`), so later items are short hypotheses. Text after the last
+  citation is an uncited claim. The perturbation pilot still uses trailing
+  citations only.
+- **Trailing period.** `Fact [E3].` counts as cited by E3 in both the generation
+  format check and the parser (the period moves to the text, flag
+  `period_after_citation`). Only one period is accepted.
+- **Duplicate ids within one claim** are counted once.
 - **Invalid (fabricated) ids** count as citations in `invalid_citation_rate` and as
-  irrelevant citations in `citation_precision`. They are never passed to NLI.
+  irrelevant / not supporting in both precisions. They are never passed to NLI.
 - **`citation_precision`** implements the SPEC definition literally (`entail(empty) =
   False`). One consequence, which matches ALCE: every citation of an unsupported
-  sentence is irrelevant unless it entails the sentence on its own.
-- **Premise.** Cited unit texts are joined by a single space in citation order. If
-  the pair exceeds 512 tokens, only the premise is truncated. The number of truncated
-  pairs is reported (`n_truncated_pairs`), because truncation can hide supporting
-  evidence.
+  claim is irrelevant unless it entails the claim on its own.
+  **`citation_precision_plain`** is reported next to it: citations that entail the
+  claim alone / all citations. The two differ when units support a claim only jointly.
+- **Premise.** Only the claim's valid cited unit texts, joined by a single space in
+  citation order. **too_long (revised):** a pair longer than the NLI limit (512
+  tokens) is never truncated and never run; it is labeled `too_long`, counts as not
+  entailed everywhere, and is logged in `nli_too_long.csv`. Truncating could hide or
+  invent support, so not entailed is the conservative label.
 - **Aggregation** is micro-averaged over sentences or citations. Rates with a zero
   denominator are `null` (n/a), not 0.
 - **`format_error` reports are included** in the metrics (parsed best-effort from the

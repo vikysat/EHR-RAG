@@ -19,14 +19,15 @@ from ehr_rag.eval.citations import SentenceEval
 
 COLUMNS: tuple[str, ...] = (
     "run_id", "condition", "hadm_id", "section", "sentence", "cited_ids", "cited_texts", "nli_label",
-    "human_support", "human_error_type", "notes", "sentence_key",
+    "human_support", "human_error_type", "notes", "sentence_key", "full_line",
 )
 HUMAN_SUPPORT_VALUES: tuple[str, ...] = ("supported", "partial", "unsupported", "not_checkable")
 
 
 def sentence_key(s: SentenceEval) -> str:
-    """Stable id of a sentence within an evaluation run."""
-    return f"{s.condition}|{s.hadm_id}|{s.section}|{s.index}"
+    """Stable id of a claim within an evaluation run (``.<k>`` added for claims of a split line)."""
+    key = f"{s.condition}|{s.hadm_id}|{s.section}|{s.index}"
+    return f"{key}.{s.claim_index}" if s.n_claims > 1 else key
 
 
 def sample_sentences(sents: list[SentenceEval], n: int, seed: int) -> list[SentenceEval]:
@@ -71,7 +72,7 @@ def write_manual_review(
                 "cited_texts": "\n".join(f"[{i}] {t[i]}" if i in t else f"[{i}] <not in evidence>"
                                          for i in s.cited_ids + s.invalid_ids),
                 "nli_label": s.nli_label, "human_support": "", "human_error_type": "", "notes": "",
-                "sentence_key": sentence_key(s),
+                "sentence_key": sentence_key(s), "full_line": s.line if s.n_claims > 1 else "",
             })
 
 

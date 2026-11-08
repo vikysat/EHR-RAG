@@ -167,36 +167,49 @@ Unknown or missing keys are errors.
 - Sections are split on the exact lines `### History`, `### Findings`,
   `### Impression`, `### Recommendations`. Every other non-blank line in a section is
   one sentence.
-- Only the trailing citation group counts (`[E3]`, `[E3, E7]`, `[E3][E7]`, `[NONE]`).
-  Ids are de-duplicated per sentence.
-- Citations elsewhere in a line are flagged `mid_sentence_citation` and ignored.
-  Lines with a sentence boundary (`.`/`!`/`?` + space + capital letter) are flagged
+- The trailing citation group (`[E3]`, `[E3, E7]`, `[E3][E7]`, `[NONE]`, optionally
+  followed by one period: `Fact [E3].`) gives the line's citations. Ids are
+  de-duplicated. The generation format check accepts the same trailing period.
+- Citations elsewhere in a line are flagged `mid_sentence_citation`. Lines with a
+  sentence boundary (`.`/`!`/`?` + space + capital letter) are flagged
   `multiple_sentences`.
 - Missing, duplicate, extra and out-of-order sections, and text before the first
   header, are flagged per report.
 
-**Metrics** (`eval/citations.py`) use every sentence of the four sections except
-abstention lines `Insufficient evidence. [NONE]` (reported as `n_abstentions`).
-A citation is *valid* if its id is in the report's `evidence_shown.json`.
+**Claims.** Before scoring, a line with citations inside it (a list such as
+`Na 130 [E1], K 5.9 [E2], and Cr 2.1 [E3].`) is split into one claim per citation
+run, each scored with only its own ids (`Na 130` [E1], `K 5.9` [E2], `Cr 2.1` [E3]).
+Leading `,;:`/`and`/`or` are removed; text after the last citation is an uncited
+claim. Other lines are one claim. Claims of a split line have `sentence_key`
+`...|<line>.<k>` and carry the whole line (`full_line` in `manual_review.csv`).
 
-- `cited_rate`: sentences with at least one valid citation / sentences.
+**Metrics** (`eval/citations.py`) use every claim of the four sections except
+abstention lines `Insufficient evidence. [NONE]` (reported as `n_abstentions`).
+`n_sentences` counts lines, `n_claims` claims; rates are over claims. A citation is
+*valid* if its id is in the report's `evidence_shown.json`. The NLI premise is only
+the texts of the claim's valid cited units, joined by a space in citation order.
+
+- `cited_rate`: claims with at least one valid citation / claims.
 - `invalid_citation_rate`: E-id citations not in `evidence_shown.json` / all E-id
   citations (`[NONE]` is not a citation).
-- `citation_recall` (ALCE, Gao et al. 2023): a sentence is supported iff it has at
-  least one valid citation and NLI(premise = texts of its valid cited units joined by
-  a space in citation order, hypothesis = sentence) is `entailment`. Recall =
-  supported / sentences.
-- `citation_precision` (ALCE): a valid citation c of a sentence with valid set C is
+- `citation_recall` (ALCE, Gao et al. 2023): a claim is supported iff it has at
+  least one valid citation and NLI(premise, hypothesis = claim) is `entailment`.
+  Recall = supported / claims.
+- `citation_precision` (ALCE): a valid citation c of a claim with valid set C is
   irrelevant iff NLI(c alone) is not entailment AND entail(C − {c}) == entail(C),
   with entail(∅) = false. Invalid ids are irrelevant. Precision = relevant citations /
   all E-id citations.
+- `citation_precision_plain`: citations that entail their claim on their own / all
+  E-id citations (invalid ids never do). Unlike ALCE, a citation that is needed only
+  jointly with another counts as not supporting.
 - Aggregates are micro-averages per condition, per section, and for History+Findings
   vs Impression+Recommendations (entailment is less meaningful for the inferential
   sections). A zero denominator gives n/a.
 - NLI model: `eval.nli_model` (default `cross-encoder/nli-deberta-v3-base`). The
-  label order comes from the model's `config.id2label`. Pairs longer than 512 tokens
-  are truncated from the premise only and counted (`n_truncated_pairs` in
-  `metrics.json`).
+  label order comes from the model's `config.id2label`. Nothing is truncated: a pair
+  longer than 512 tokens is not run, gets the label `too_long`, and counts as not
+  entailed. Every such pair is listed in `nli_too_long.csv` (claim, premise ids,
+  token count) and counted in `metrics.json` (`nli.n_too_long_pairs`).
 - Reports that ended in `format_error` are included (best-effort parse of the final
   raw output) and counted per condition.
 
@@ -251,7 +264,8 @@ one the command exits. References are never generated.
 - **NLI verifier limitations:**
   - It is a general-domain sentence-pair model (`cross-encoder/nli-deberta-v3-base`),
     not trained on clinical text, numbers or units.
-  - Premises longer than 512 tokens are truncated (counted in `metrics.json`).
+  - Pairs longer than 512 tokens are labeled `too_long` and count as not entailed,
+    which lowers recall for claims that cite many long units (see `nli_too_long.csv`).
   - Entailment is not a good test for the inferential Impression/Recommendations
     sentences, which is why they are reported separately.
   - Agreement with human labels has to be measured (`verifier-agreement`) before the

@@ -540,11 +540,18 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     res = run_evaluation(gen_dir, run.path, run.run_id, nli, cfg["eval"]["manual_review_n"], seed)
 
     print(f"\n== Metrics (micro-averaged; abstention lines excluded) for generation run {args.generation_run}")
-    print(f"{'condition':<13} {'scope':<27} {'sent':>5} {'abst':>5} " + " ".join(f"{m:>22}" for m in METRICS))
+    print(f"{'condition':<13} {'scope':<27} {'sent':>5} {'claim':>5} {'abst':>5} "
+          + " ".join(f"{m:>24}" for m in METRICS))
     for r in res["rows"]:
         if r["scope"] in GROUPS:
-            vals = " ".join(f"{'n/a' if r[m] is None else format(r[m], '.3f'):>22}" for m in METRICS)
-            print(f"{r['condition']:<13} {r['scope']:<27} {r['n_sentences']:>5} {r['n_abstentions']:>5} {vals}")
+            vals = " ".join(f"{'n/a' if r[m] is None else format(r[m], '.3f'):>24}" for m in METRICS)
+            print(f"{r['condition']:<13} {r['scope']:<27} {r['n_sentences']:>5} {r['n_claims']:>5} "
+                  f"{r['n_abstentions']:>5} {vals}")
+    print("citation_precision = ALCE definition; citation_precision_plain = share of citations that entail "
+          "their claim alone")
+    print(f"NLI pairs over {res['nli']['max_length']} tokens, labeled too_long (not entailed): "
+          f"{res['nli']['n_too_long_pairs']} ({res['n_too_long_rows']} claim/premise rows in nli_too_long.csv); "
+          "truncated: 0")
     print(f"\nformat status: {res['format_counts']}")
     sample = gate_sample(res["sentences"], res["texts"], 10, seed)
     run.write_json("gate_sample.json", sample)
@@ -556,11 +563,13 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     for i, x in enumerate(sample, 1):
         print(f"\n[{i}] {x['condition']} hadm {x['hadm_id']} {x['section']}")
         print(f"  sentence : {x['sentence']}")
+        if x["line"]:
+            print(f"  (claim of: {x['line']})")
         print(f"  cited    : {x['cited_ids']}  invalid: {x['invalid_ids']}  irrelevant: {x['irrelevant_ids']}")
         for uid, t in zip(x["cited_ids"], x["cited_texts"]):
             print(f"    [{uid}] {t}")
         print(f"  NLI      : {x['nli_label']}")
-    print(f"\nwrote metrics.json, metrics_by_section.csv, metrics_summary.md, sentences.jsonl, "
+    print(f"\nwrote metrics.json, metrics_by_section.csv, metrics_summary.md, sentences.jsonl, nli_too_long.csv, "
           f"manual_review.csv ({res['n_manual_review']} rows) to {run.path}")
     run.finish(nli=res["nli"], format_counts=res["format_counts"], n_manual_review=res["n_manual_review"])
     return 0

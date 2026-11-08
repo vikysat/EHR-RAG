@@ -7,7 +7,7 @@ with ``format_error`` status are INCLUDED (parsed best-effort) and counted.
 
 Writes into the evaluation run: ``sentences.jsonl`` (every sentence with its NLI
 result), ``metrics.json``, ``metrics_by_section.csv``, ``metrics_summary.md``,
-``manual_review.csv``.
+``manual_review.csv``, ``nli_too_long.csv`` (every pair labeled ``too_long``).
 """
 
 from __future__ import annotations
@@ -20,12 +20,15 @@ from pathlib import Path
 from typing import Any
 
 from ehr_rag.config import CONDITIONS
-from ehr_rag.eval.citations import GROUPS, SentenceEval, aggregate, evaluate_report, metrics_table
+from ehr_rag.eval.citations import GROUPS, SentenceEval, aggregate, evaluate_report, metrics_table, premise_text
 from ehr_rag.eval.manual_review import sample_sentences, write_manual_review
 from ehr_rag.eval.nli import NLI
 from ehr_rag.eval.parse import parse_report
 
-METRICS = ("cited_rate", "invalid_citation_rate", "citation_recall", "citation_precision")
+METRICS = ("cited_rate", "invalid_citation_rate", "citation_recall", "citation_precision",
+           "citation_precision_plain")
+TOO_LONG_COLUMNS = ("condition", "hadm_id", "section", "index", "claim_index", "premise_ids", "kind", "n_tokens",
+                    "max_length")
 SUMMARY_NOTE = (
     "Entailment-based recall/precision are most meaningful for History+Findings; Impression+Recommendations "
     "contain clinical reasoning that a sentence-level NLI verifier is not expected to capture. "
@@ -76,15 +79,20 @@ def summary_markdown(rows: list[dict[str, Any]], format_counts: dict[str, dict[s
     """``metrics_summary.md``."""
     lines = [f"# Metrics summary: generation run `{gen_run}`", "",
              f"NLI verifier: `{nli_info.get('model')}` (revision `{nli_info.get('revision')}`); "
-             f"premise truncated for {nli_info.get('n_truncated_pairs', 0)} pair(s).", "",
-             "| condition | scope | sentences | abstentions | cited_rate | invalid_citation_rate | "
-             "citation_recall | citation_precision |",
-             "|---|---|---|---|---|---|---|---|"]
+             f"{nli_info.get('n_too_long_pairs', 0)} premise/claim pair(s) longer than "
+             f"{nli_info.get('max_length', 'the model limit')} tokens were labeled `too_long` (not entailed; "
+             "listed in `nli_too_long.csv`); nothing was truncated.", "",
+             "Precision: `citation_precision` is ALCE (a citation is irrelevant if it does not entail the claim "
+             "alone and removing it does not change whether the rest entail it); `citation_precision_plain` is "
+             "the share of citations that entail their claim on their own.", "",
+             "| condition | scope | sentences | claims | abstentions | cited_rate | invalid_citation_rate | "
+             "citation_recall | citation_precision (ALCE) | citation_precision_plain |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         if r["scope"] not in GROUPS:
             continue
-        lines.append(f"| {r['condition']} | {r['scope']} | {r['n_sentences']} | {r['n_abstentions']} | "
-                     + " | ".join(_fmt(r[m]) for m in METRICS) + " |")
+        lines.append(f"| {r['condition']} | {r['scope']} | {r['n_sentences']} | {r['n_claims']} | "
+                     f"{r['n_abstentions']} | " + " | ".join(_fmt(r[m]) for m in METRICS) + " |")
     lines += ["", "Format status of the reports (from generation):", "",
               "| condition | ok | ok_after_retry | format_error |", "|---|---|---|---|"]
     for c, n in format_counts.items():
@@ -122,6 +130,11 @@ def run_evaluation(
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
+    too_long = too_long_rows(sents, texts, nli)
+    with (out_dir / "nli_too_long.csv").open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=TOO_LONG_COLUMNS)
+        w.writeheader()
+        w.writerows(too_long)
     info = nli.info()
     metrics = {
         "generation_run": gen_run_dir.name, "nli": info, "format_status": format_counts,
@@ -135,7 +148,23 @@ def run_evaluation(
     sample = sample_sentences(sents, manual_review_n, seed)
     write_manual_review(out_dir / "manual_review.csv", run_id, sample, texts)
     return {"rows": rows, "format_counts": format_counts, "sentences": sents, "texts": texts,
-            "n_manual_review": len(sample), "nli": info, "reports": reports}
+            "n_manual_review": len(sample), "nli": info, "reports": reports, "n_too_long_rows": len(too_long)}
+
+
+def too_long_rows(sents: list[SentenceEval], texts: dict[tuple[str, int], dict[str, str]],
+                  nli: NLI) -> list[dict[str, Any]]:
+    """One row per (claim, premise) pair labeled ``too_long``: ``kind`` is all / single / without_one."""
+    tokens = getattr(nli, "pair_tokens", {})
+    max_length = getattr(nli, "max_length", None)
+    out = []
+    for s in sents:
+        for ids in s.too_long:
+            kind = "all" if ids == s.cited_ids else "single" if len(ids) == 1 else "without_one"
+            premise = premise_text(ids, texts[(s.condition, s.hadm_id)])
+            out.append({"condition": s.condition, "hadm_id": s.hadm_id, "section": s.section, "index": s.index,
+                        "claim_index": s.claim_index, "premise_ids": " ".join(ids), "kind": kind,
+                        "n_tokens": tokens.get((premise, s.sentence)), "max_length": max_length})
+    return out
 
 
 def gate_sample(sents: list[SentenceEval], texts: dict[tuple[str, int], dict[str, str]], n: int,
@@ -144,6 +173,6 @@ def gate_sample(sents: list[SentenceEval], texts: dict[tuple[str, int], dict[str
     pool = [s for s in sents if not s.is_abstention]
     pick = random.Random(seed).sample(pool, min(n, len(pool)))
     return [{"condition": s.condition, "hadm_id": s.hadm_id, "section": s.section, "sentence": s.sentence,
-             "cited_ids": s.cited_ids, "invalid_ids": s.invalid_ids,
+             "line": s.line if s.n_claims > 1 else None, "cited_ids": s.cited_ids, "invalid_ids": s.invalid_ids,
              "cited_texts": [texts[(s.condition, s.hadm_id)][i] for i in s.cited_ids],
              "nli_label": s.nli_label, "irrelevant_ids": s.irrelevant_ids} for s in pick]

@@ -148,8 +148,11 @@ class FakeNLI:
     model_name = "fake-nli"
     entailment_label = "entailment"
 
-    def __init__(self) -> None:
+    def __init__(self, max_length: int = 512) -> None:
+        """``max_length`` is in whitespace tokens: longer pairs get ``too_long`` (as HFNLI)."""
         self.calls: list[tuple[str, str]] = []
+        self.max_length = max_length
+        self.pair_tokens: dict[tuple[str, str], int] = {}
 
     @staticmethod
     def rule(premise: str, hyp: str) -> str:
@@ -162,9 +165,17 @@ class FakeNLI:
         return "entailment" if ok else "neutral"
 
     def labels(self, pairs: list[tuple[str, str]]) -> list[str]:
+        from ehr_rag.eval.nli import TOO_LONG
+
         self.calls.extend(pairs)
-        return [self.rule(p, h) for p, h in pairs]
+        out = []
+        for p, h in pairs:
+            self.pair_tokens[(p, h)] = n = len(p.split()) + len(h.split())
+            out.append(TOO_LONG if n > self.max_length else self.rule(p, h))
+        return out
 
     def info(self) -> dict[str, Any]:
+        n_long = sum(1 for n in self.pair_tokens.values() if n > self.max_length)
         return {"model": self.model_name, "revision": "fake", "id2label": {0: "entailment", 1: "neutral"},
-                "entailment_label": "entailment", "n_truncated_pairs": 0}
+                "entailment_label": "entailment", "max_length": self.max_length, "too_long_label": "too_long",
+                "n_too_long_pairs": n_long, "n_truncated_pairs": 0}

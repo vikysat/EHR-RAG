@@ -146,8 +146,9 @@ Run folder: `runs/<EVAL_RUN>` (see `runs/slurm-<jobid>.out`).
     the ones the model saw, is the NLI label plausible?
 - `runs/<EVAL_RUN>/metrics_summary.md`: the same table in markdown, plus the format
   status per condition.
-- `runs/<EVAL_RUN>/metrics.json` → `nli.n_truncated_pairs`. If this is large, long
-  premises were cut.
+- `runs/<EVAL_RUN>/metrics.json` → `nli.n_too_long_pairs`, and `nli_too_long.csv`:
+  pairs over 512 tokens are labeled `too_long` and count as not entailed (nothing is
+  truncated). If there are many, recall is understated for claims citing many units.
 - Sanity: `no_retrieval` should have `n_citations = 0` and `cited_rate` 0 or n/a;
   `invalid_citation_rate` shows fabricated ids.
 

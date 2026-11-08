@@ -40,7 +40,7 @@ from ehr_rag.runs import Run
 
 _HEADER_LINES = {f"### {s}": s for s in SECTIONS}
 _CITE_GROUP = r"\[(?:NONE|E\d+(?:\s*,\s*E\d+)*)\]"
-_TRAILING_RE = re.compile(rf"(?:\s*{_CITE_GROUP})+\s*$")
+_TRAILING_RE = re.compile(rf"(?:\s*{_CITE_GROUP})+\s*\.?\s*$")  # one period may follow
 _CITE_ID_RE = re.compile(r"E\d+|NONE")
 _BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
 MAX_PROBLEMS_IN_REMINDER = 10
@@ -63,7 +63,8 @@ def check_format(text: str, none_only: bool = False) -> tuple[dict[str, list[dic
     Rules: exactly the four ``### <Section>`` header lines in order; one sentence per
     line; no bullets; no blank line between two sentence lines of a section (blank
     lines right before a header are allowed); every line ends with a citation group
-    (``[E3]``, ``[E3, E7]``, ``[E3][E7]`` or ``[NONE]``). With ``none_only`` (the
+    (``[E3]``, ``[E3, E7]``, ``[E3][E7]`` or ``[NONE]``), optionally followed by one
+    period (``Fact [E3].`` passes, as in the Phase 5 parser). With ``none_only`` (the
     no_retrieval condition) every citation must be ``[NONE]``. Citation ids are not
     checked against the evidence here (that is a Phase 5 metric).
     """

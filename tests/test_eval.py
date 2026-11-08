@@ -230,3 +230,129 @@ def test_evaluate_includes_format_errors(env: dict[str, Any]) -> None:
     assert rep["parse_flags"]["missing_sections"] == ["Impression", "Recommendations"]
     with (out.path / "metrics_by_section.csv").open(encoding="utf-8") as f:
         assert len(list(csv.DictReader(f))) == 3 * 7
+
+
+# --------------------------------------------------------------------------- scorer fixes (claims, premise, too_long, precision)
+
+
+def test_parse_trailing_period_after_citations() -> None:
+    r = parse_report("### History\nFake fact [E3].\nFake fact two. [E3, E4].\nInsufficient evidence [NONE].\n"
+                     "Fake [E3] in the middle.\nFake double [E3]..\n")
+    a, b, c, d, e = r.sections["History"]
+    assert (a.text, a.citations) == ("Fake fact.", ["E3"]) and "period_after_citation" in a.flags
+    assert (b.text, b.citations) == ("Fake fact two.", ["E3", "E4"])
+    assert c.is_abstention and c.citations == ["NONE"]
+    assert d.citations == [] and d.mid_citations == ["E3"]           # not trailing: still uncited
+    assert e.citations == [] and "no_trailing_citation" in e.flags   # only ONE period may follow
+
+
+def test_split_claims_list_sentence() -> None:
+    from ehr_rag.eval.parse import split_claims
+
+    s = parse_report("### Findings\nFake labs: Na 130 [E1], K 5.9 [E2], and Cr 2.1 [E3][E4].\n").sections["Findings"][0]
+    assert split_claims(s) == [("Fake labs: Na 130", ["E1"]), ("K 5.9", ["E2"]), ("Cr 2.1", ["E3", "E4"])]
+    s = parse_report("### Findings\nFakeium was 5.9 [E3] and FakeDrugA was given. [E4]\n").sections["Findings"][0]
+    assert split_claims(s) == [("Fakeium was 5.9", ["E3"]), ("FakeDrugA was given.", ["E4"])]
+    s = parse_report("### Findings\nFakeium 5.9 [E3] then something uncited.\n").sections["Findings"][0]
+    assert split_claims(s) == [("Fakeium 5.9", ["E3"]), ("then something uncited.", [])]
+    s = parse_report("### Findings\nPlain fake sentence. [E1, E2]\n").sections["Findings"][0]
+    assert split_claims(s) == [("Plain fake sentence.", ["E1", "E2"])]
+
+
+LIST_EVIDENCE = [
+    {"unit_id": "E1", "unit_type": "lab", "text": "Fakeium (Blood): max 5.9."},
+    {"unit_id": "E2", "unit_type": "lab", "text": "Fakeone (Blood): last 4.1."},
+    {"unit_id": "E3", "unit_type": "medication", "text": "FakeDrugA 40 mg IV."},
+]
+
+
+def test_list_sentence_scored_per_claim_with_own_citations() -> None:
+    from ehr_rag.eval.manual_review import sentence_key
+
+    nli = FakeNLI()
+    rep = "### Findings\nFake labs were 5.9 [E1], 4.1 [E2], and 99 [E3].\n"
+    ev = evaluate_report(parse_report(rep), LIST_EVIDENCE, "ehr_rag", 12, nli)
+    assert [(e.sentence, e.cited_ids, e.supported) for e in ev] == [
+        ("Fake labs were 5.9", ["E1"], True), ("4.1", ["E2"], True), ("99", ["E3"], False)]
+    assert all("split_claim" in e.flags and e.n_claims == 3 for e in ev)
+    assert ev[0].line == "Fake labs were 5.9, 4.1, and 99."
+    assert [sentence_key(e) for e in ev] == [f"ehr_rag|12|Findings|0.{k}" for k in range(3)]
+    agg = aggregate(ev)
+    assert agg["n_sentences"] == 1 and agg["n_claims"] == 3 and agg["n_split_sentences"] == 1
+    assert agg["citation_recall"] == pytest.approx(2 / 3) and agg["n_mid_sentence_citation"] == 1
+    # each claim's NLI premise is only its own cited unit
+    assert {p for p, _ in nli.calls} == {u["text"] for u in LIST_EVIDENCE}
+    assert ("Fakeone (Blood): last 4.1.", "4.1") in nli.calls
+    assert not any(p == "Fakeium (Blood): max 5.9." and h == "4.1" for p, h in nli.calls)
+
+
+def test_premise_is_only_the_cited_units() -> None:
+    nli = FakeNLI()
+    ev = evaluate_report(parse_report("### Findings\nFake 5.9 and 40. [E1, E3]\n"), LIST_EVIDENCE,
+                         "ehr_rag", 12, nli)
+    t = {u["unit_id"]: u["text"] for u in LIST_EVIDENCE}
+    assert {p for p, _ in nli.calls} == {t["E1"] + " " + t["E3"], t["E1"], t["E3"]}   # never E2 or all evidence
+    assert ev[0].supported
+
+
+def test_precision_alce_vs_plain() -> None:
+    rep = ("### Findings\n"
+           "Fake values 5.9 and 4.1. [E1, E2]\n"     # only jointly entailed: ALCE 2/2 relevant, plain 0/2
+           "Fake value 5.9. [E1, E3]\n"              # E1 alone entails, E3 irrelevant: ALCE 1/2, plain 1/2
+           "Fake made-up 77. [E9]\n")                # invalid id: irrelevant and not supporting
+    a, b, c = evaluate_report(parse_report(rep), LIST_EVIDENCE, "ehr_rag", 12, FakeNLI())
+    assert a.supported and a.irrelevant_ids == [] and a.supporting_ids == []
+    assert b.supported and b.irrelevant_ids == ["E3"] and b.supporting_ids == ["E1"]
+    assert c.invalid_ids == ["E9"] and c.supporting_ids == []
+    agg = aggregate([a, b, c])
+    assert agg["n_citations"] == 5
+    assert agg["citation_precision"] == pytest.approx(3 / 5)
+    assert agg["citation_precision_plain"] == pytest.approx(1 / 5)
+
+
+def test_too_long_counts_as_not_entailed() -> None:
+    from ehr_rag.eval.nli import TOO_LONG
+
+    long_unit = {"unit_id": "E4", "unit_type": "lab", "text": "Fakeium 5.9 " + "padding " * 40}
+    rep = "### Findings\nFakeium 5.9. [E4]\nFakeium 5.9 again. [E1, E4]\nFakeium 5.9 short. [E1]\n"
+    a, b, c = evaluate_report(parse_report(rep), LIST_EVIDENCE + [long_unit], "ehr_rag", 12,
+                              FakeNLI(max_length=20))
+    assert a.nli_label == TOO_LONG and not a.supported and a.supporting_ids == [] and a.too_long == [["E4"]]
+    assert a.irrelevant_ids == ["E4"]                       # too_long never entails, so never relevant alone
+    assert b.nli_label == TOO_LONG and not b.supported and b.supporting_ids == ["E1"]
+    assert sorted(b.too_long) == [["E1", "E4"], ["E4"]]
+    assert c.supported and c.too_long == []
+    agg = aggregate([a, b, c])
+    assert agg["citation_recall"] == pytest.approx(1 / 3) and agg["n_too_long_claims"] == 2
+
+
+def test_evaluate_writes_too_long_log(env: dict[str, Any]) -> None:
+    gen = _generate(env, realistic_responder)
+    out = start_run(env["cfg"], "evaluate", command="evaluate")
+    res = run_evaluation(gen, out.path, out.run_id, FakeNLI(max_length=8), manual_review_n=5, seed=13)
+    with (out.path / "nli_too_long.csv").open(encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert rows and res["n_too_long_rows"] == len(rows)
+    assert all(int(r["n_tokens"]) > int(r["max_length"]) == 8 for r in rows)
+    assert {r["kind"] for r in rows} <= {"all", "single", "without_one"}
+    m = json.loads((out.path / "metrics.json").read_text(encoding="utf-8"))
+    assert m["nli"]["n_too_long_pairs"] > 0 and m["nli"]["n_truncated_pairs"] == 0
+    assert "citation_precision_plain" in m["conditions"]["ehr_rag"]["ALL"]
+    summary = (out.path / "metrics_summary.md").read_text(encoding="utf-8")
+    assert "too_long" in summary and "citation_precision (ALCE)" in summary
+
+
+def test_hfnli_too_long_pairs_never_reach_the_model() -> None:
+    from ehr_rag.eval.nli import HFNLI, TOO_LONG
+
+    nli = HFNLI.__new__(HFNLI)                     # no model download: replace the two model-facing steps
+    nli.id2label, nli.entailment_label = {0: "entailment", 1: "neutral"}, "entailment"
+    nli.batch_size, nli.max_length, nli._memo, nli.pair_tokens = 2, 10, {}, {}
+    nli.model_name, nli.revision, nli.device = "fake-hf", "fake", "cpu"
+    seen: list[tuple[str, str]] = []
+    nli._n_tokens = lambda batch: [len(p.split()) + len(h.split()) for p, h in batch]  # type: ignore[method-assign]
+    nli._predict = lambda batch: (seen.extend(batch), ["entailment"] * len(batch))[1]  # type: ignore[method-assign]
+    short, long_ = ("fake premise", "fake claim"), ("fake " * 20, "fake claim")
+    assert nli.labels([short, long_, short]) == ["entailment", TOO_LONG, "entailment"]
+    assert seen == [short] and nli.pair_tokens[long_] == 22
+    assert nli.info()["n_too_long_pairs"] == 1 and nli.info()["n_truncated_pairs"] == 0

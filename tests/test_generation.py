@@ -295,3 +295,13 @@ def test_run_config_snapshot_records_generation_settings(env: dict[str, Any]) ->
     run, _ = _run(env, FakeBackend(), ["no_retrieval"])
     snap = yaml.safe_load((run.path / "config.yaml").read_text(encoding="utf-8"))
     assert snap["generation"]["temperature"] == 0.0
+
+
+def test_check_format_accepts_one_period_after_citations() -> None:
+    text = good_report(["E1", "E2"]).replace("one. [E1]\n", "one [E1].\n")
+    sections, problems = check_format(text)
+    assert problems == []
+    assert sections["History"][0]["citations"] == ["E1"]
+    assert sections["History"][0]["sentence"] == "Fake history sentence one"
+    _, problems = check_format(good_report(["E1", "E2"]).replace("one. [E1]\n", "one [E1]..\n"))
+    assert any("does not end with a citation" in p for p in problems)
