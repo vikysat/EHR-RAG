@@ -373,3 +373,77 @@ sbatch scripts/cli.sbatch text-metrics --config config/full.yaml --generation-ru
 ```
 `evaluate` writes `gate_sample.json` instead of printing sentences;
 `text-metrics` prints counts and per-condition mean/median ROUGE-L and BERTScore F1.
+
+---
+
+## 11. Citation checker: tune on dev, freeze, enforce
+
+The checker reads `config/checker.yaml` (rules) and `config/checker_lexicon.yaml`
+(vocabulary). Tune them ONLY on dev, freeze them, then run test with the frozen hash.
+
+### 11.1 Tune the lexicon on dev (CPU, no model, repeat as needed)
+
+Uses the dev generation run(s) from 10.6 (`DEV_SHARDS=$(ls runs | grep -- "-generate-job<dev jobid>-shard")`):
+```bash
+python -m ehr_rag.cli check-citations --config config/full.yaml --generation-run $DEV_SHARDS
+python -m ehr_rag.cli enforce-filter  --config config/full.yaml --generation-run $DEV_SHARDS
+```
+Read `runs/<CHECK_RUN>/checker_summary.md` and fill `checker_review.csv`
+(`human_checker_correct` = yes/no for every failing line and for the sampled passing and
+unchecked lines). Then adjust the lexicon or rules:
+- false `name_missing`: add the missing synonym/abbreviation group, or a stopword;
+- false `number_mismatch`: add an `ignore_patterns` context (non-clinical numbers);
+- false `direction_mismatch` / `trend_mismatch`: check the words lists and `window_tokens`;
+- many `unchecked` lines with real content: names the vocabulary misses (coverage).
+Re-run `check-citations` after each edit (seconds; no regeneration needed). The
+`enforce-filter` table shows how many lines and numbers a strict checker would remove.
+
+### 11.2 Freeze
+
+```bash
+python -m ehr_rag.cli validate-config --config config/full.yaml | grep "combined sha256"
+git add config/checker.yaml config/checker_lexicon.yaml
+git commit -m "Freeze citation checker for the test run" && git push origin main
+```
+Write down the combined sha256 (`CHECKER_SHA`). Every later run records it in
+`run_meta.json`, and `--checker-sha256 $CHECKER_SHA` refuses to run if any of the
+rules, lexicon or rewrite prompt changed.
+
+### 11.3 Enforced generation on dev (GPU)
+
+```bash
+sbatch --array=0 scripts/generate_array.sbatch --config config/full.yaml --split dev \
+    --retrieval-run <RETRIEVE_DEV> \
+    --conditions no_retrieval ehr_rag full_context ehr_rag_enforced full_context_enforced \
+    --checker-sha256 $CHECKER_SHA --yes
+```
+The base reports come from `cache/generation/` (same prompts as 10.6), so the new calls
+are only the rewrites: at most one per failing line. The end of `stdout.log` has the
+enforcement table (kept / repaired / retreated / dropped; numbers kept).
+
+### 11.4 Enforced generation on test (GPU; after 11.2, never retune afterwards)
+
+```bash
+HF_HUB_OFFLINE=1 python -m ehr_rag.cli retrieve --config config/full.yaml --split test   # -> RETRIEVE_TEST
+sbatch --array=0-3 scripts/generate_array.sbatch --config config/full.yaml --split test \
+    --retrieval-run <RETRIEVE_TEST> \
+    --conditions no_retrieval ehr_rag full_context ehr_rag_enforced full_context_enforced \
+    --checker-sha256 $CHECKER_SHA --yes
+```
+If GPU time is short: generate only the base conditions, then filter on CPU:
+```bash
+python -m ehr_rag.cli enforce-filter --config config/full.yaml --generation-run $TEST_SHARDS \
+    --checker-sha256 $CHECKER_SHA
+```
+
+### 11.5 Reports (checker statistics separate from evaluation)
+
+```bash
+python -m ehr_rag.cli check-citations --config config/full.yaml --generation-run $TEST_SHARDS [<FILTER_RUN>] \
+    --checker-sha256 $CHECKER_SHA
+sbatch scripts/cli.sbatch evaluate --config config/full.yaml --generation-run $TEST_SHARDS [<FILTER_RUN>]
+```
+`check-citations`: status and coverage per condition, the error profile per section,
+repair vs retreat and the share of lines and numbers kept after enforcement.
+`evaluate`: NLI and manual-review metrics for every condition including the enforced and
+filtered ones; it never uses the checker.
