@@ -70,6 +70,7 @@ Every command that produces results writes `runs/<YYYYMMDD-HHMMSS-name>/`, conta
 | 0 | `validate-config` | any | validate and print the config (unknown keys are errors) |
 | 1 | `inspect-data` | CPU | data tree, header check vs SPEC, 5 rows per table, row counts, lab linkage |
 | 2 | `select-admissions` | CPU | admission metrics, `data/derived/admission_candidates.csv`, proposed `config/selected_admissions.yaml` (edit by hand) |
+| 2a | `select-cohort [--skip-note-filter]` | CPU | full MIMIC-IV (DuckDB over csv.gz): seeded dev/test cohort; prints counts only; id lists in `cohort.out_dir` (gitignored), SHA-256 hashes in `config/cohort/*.sha256` |
 | 3 | `build-units` | CPU | evidence units + headers: `data/derived/units/<hadm_id>.jsonl`, `<hadm_id>_header.json` |
 | 4 | `retrieve` | CPU/GPU | BM25 + MedCPT dense + RRF per section; `retrieval/<hadm_id>.json` incl. the ordered `evidence_units` used by `generate` |
 | 5 | `export-relevance` | CPU/GPU | `relevance_to_label.csv`: pooled top-10 (BM25, dense, fused) for manual labeling |
@@ -115,6 +116,11 @@ Unknown or missing keys are errors.
 | `data.derived` | derived files (candidates, units) |
 | `selection.min_distinct_labs / min_abnormal_labs / min_distinct_drugs / min_diagnoses` | eligibility thresholds |
 | `selection.n_admissions` | number of proposed target admissions |
+| `cohort.mimic_root / note_root / demo_root` | full MIMIC-IV (`hosp/`), MIMIC-IV-Note (`note/`), Demo (subject ids to exclude, reference columns) |
+| `cohort.out_dir` | gitignored: `<split>_hadm_ids.txt`, extracted Parquet, reference notes |
+| `cohort.pool_fraction / seed` | seeded share of all subject_ids drawn before the filters |
+| `cohort.min_los_days / max_los_days / min_prior_admissions / min_lab_results` | eligibility (inclusive) |
+| `cohort.n_dev / n_test` | admissions per split (one per patient; splits share no patient) |
 | `units.max_prior_admissions`, `units.max_history_dx_per_admission` | caps for history_diagnosis units |
 | `retrieval.dense_query_model / dense_doc_model` | MedCPT encoders |
 | `retrieval.rrf_k` | Reciprocal Rank Fusion constant |

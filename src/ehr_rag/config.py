@@ -40,6 +40,20 @@ SCHEMA: dict[str, Any] = {
         "min_diagnoses": _INT,
         "n_admissions": _INT,
     },
+    "cohort": {
+        "mimic_root": _STR,
+        "note_root": _STR,
+        "demo_root": _STR,
+        "out_dir": _STR,
+        "pool_fraction": _NUM,
+        "seed": _INT,
+        "min_los_days": _NUM,
+        "max_los_days": _NUM,
+        "min_prior_admissions": _INT,
+        "min_lab_results": _INT,
+        "n_dev": _INT,
+        "n_test": _INT,
+    },
     "units": {"max_prior_admissions": _INT, "max_history_dx_per_admission": _INT},
     "retrieval": {
         "dense_query_model": _STR,
@@ -140,6 +154,14 @@ def validate_config(cfg: dict[str, Any]) -> None:
     for key in ("top_k_per_query", "max_units_per_section", "max_units_total", "rrf_k"):
         if cfg["retrieval"][key] < 1:
             raise ConfigError(f"retrieval.{key}: must be >= 1")
+    co = cfg["cohort"]
+    if not 0 < co["pool_fraction"] <= 1:
+        raise ConfigError("cohort.pool_fraction: must be in (0, 1]")
+    if co["min_los_days"] > co["max_los_days"]:
+        raise ConfigError("cohort.min_los_days: must be <= cohort.max_los_days")
+    for key in ("n_dev", "n_test", "min_prior_admissions", "min_lab_results"):
+        if co[key] < 0:
+            raise ConfigError(f"cohort.{key}: must be >= 0")
 
 
 def validate_for_generation(cfg: dict[str, Any]) -> None:

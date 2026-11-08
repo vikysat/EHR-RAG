@@ -10,6 +10,20 @@ selection:
   min_diagnoses: 3
   n_admissions: 15
 
+cohort:                        # select-cohort / extract-cohort (full MIMIC-IV, DuckDB)
+  mimic_root: data/mimiciv     # full MIMIC-IV (hosp/*.csv.gz); symlink on the cluster
+  note_root: data/mimic-iv-note   # MIMIC-IV-Note (note/discharge.csv.gz); symlink on the cluster
+  demo_root: data/mimic-iv-clinical-database-demo-2.2   # subject ids to exclude; reference columns
+  out_dir: data/cohort         # gitignored: id lists, extracted Parquet, reference notes
+  pool_fraction: 0.1           # seeded share of all subject_ids
+  seed: 13
+  min_los_days: 2              # hospital stay, inclusive bounds
+  max_los_days: 14
+  min_prior_admissions: 1
+  min_lab_results: 20          # labevents rows with this hadm_id
+  n_dev: 20
+  n_test: 100
+
 units:
   max_prior_admissions: 3
   max_history_dx_per_admission: 5

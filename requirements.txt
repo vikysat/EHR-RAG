@@ -8,6 +8,7 @@
 # See README "GPU server (CUDA 12.x)".
 numpy==2.4.6
 pandas==3.0.6
+duckdb==1.5.6
 pyyaml==6.0.3
 rank_bm25==0.2.2
 faiss-cpu==1.15.1

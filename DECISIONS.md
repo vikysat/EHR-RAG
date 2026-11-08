@@ -123,3 +123,23 @@ better than it is, never guesses, and keeps the raw data for manual review.
 - **Testing:** the notebook is tested by executing its code cells against runs
   produced by the full CLI chain on fake data. Jupyter is not added to
   `requirements.txt`.
+
+## Full MIMIC-IV cohort
+
+- **Selection order** (`select-cohort`, counts printed after each step): all subjects in
+  `patients` → seeded pool (`round(pool_fraction × n)` drawn with
+  `random.Random(f"{seed}:pool")` from the sorted ids) → Demo subjects removed
+  (`demo_subject_id.csv`) → their admissions → stay 2–14 days (inclusive, from
+  admittime/dischtime) → ≥ 1 prior admission (the `select-admissions` definition) →
+  ≥ 20 `labevents` rows with this `hadm_id` → a discharge note in `note/discharge`.
+- **Lab count** uses rows linked by `hadm_id` only. `build-units` also links null-hadm
+  rows by time window, so the evidence never has fewer lab rows than the filter saw.
+- **One admission per patient**, the latest eligible one (as in `select-admissions`).
+  Eligible patients are shuffled with `random.Random(f"{seed}:draw")`; the first
+  `n_dev` are dev, the next `n_test` are test, so the splits never share a patient.
+- **Id lists** are sorted, one id per line, under `cohort.out_dir` (gitignored). The
+  committed `config/cohort/<split>_hadm_ids.sha256` is in `sha256sum` format. Every
+  command that reads a split checks the hash first. `select-cohort` refuses to
+  replace existing hashes without `--overwrite`.
+- **Testing on the Demo** needs `--skip-note-filter` (no notes) and
+  `--no-demo-exclusion` (otherwise nothing is left).

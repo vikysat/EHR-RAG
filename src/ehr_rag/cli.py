@@ -108,6 +108,43 @@ def cmd_select_admissions(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_select_cohort(args: argparse.Namespace) -> int:
+    """Seeded dev/test cohort from full MIMIC-IV (DuckDB); prints counts only."""
+    from ehr_rag.config import resolve_path
+    from ehr_rag.data.cohort import (
+        SPLITS, CohortError, demo_subject_ids, find_note_file, hash_path, select_cohort, write_split,
+    )
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    co = dict(cfg["cohort"])
+    for key in ("pool_fraction", "n_dev", "n_test"):
+        if getattr(args, key) is not None:
+            co[key] = getattr(args, key)
+    existing = [hash_path(cfg, s) for s in SPLITS if hash_path(cfg, s).exists()]
+    if existing and not args.overwrite:
+        raise ConfigError(f"cohort hashes already exist ({', '.join(p.name for p in existing)}); "
+                          "the cohort is fixed. Pass --overwrite only to replace it on purpose.")
+    note_file = None if args.skip_note_filter else find_note_file(resolve_path(cfg, co["note_root"]))
+    exclude = None if args.no_demo_exclusion else demo_subject_ids(resolve_path(cfg, co["demo_root"]))
+    run = start_run(cfg, "select-cohort", command="select-cohort", seed=co["seed"])
+    print("== Cohort selection (counts only)")
+    try:
+        sel = select_cohort(resolve_path(cfg, co["mimic_root"]), note_file, exclude, co)
+    except CohortError as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        run.finish(status="failed", error=str(e))
+        return 4
+    hashes = {s: write_split(cfg, s, sel.splits[s]) for s in SPLITS}
+    print("\nwrote the id lists (gitignored) and their hashes:")
+    for s in SPLITS:
+        print(f"  {hash_path(cfg, s)}  sha256 {hashes[s]}")
+    run.finish(params=co, counts=sel.counts, sha256=hashes, skip_note_filter=args.skip_note_filter,
+               demo_exclusion=not args.no_demo_exclusion)
+    print(f"run: {run.path}")
+    return 0
+
+
 def _selected_ids(cfg: dict) -> list[int]:
     from ehr_rag.config import project_root
     from ehr_rag.data.select_admissions import load_selected_hadm_ids
@@ -607,6 +644,16 @@ def build_parser() -> argparse.ArgumentParser:
         "Phase 1: print data tree, header check, 5 rows per table, row counts, lab linkage.")
     add("select-admissions", cmd_select_admissions,
         "Phase 1: compute admission metrics, write candidates CSV and proposed selected_admissions.yaml.")
+    p = add("select-cohort", cmd_select_cohort,
+            "Full MIMIC-IV: seeded dev/test cohort (DuckDB); id lists gitignored, hashes in config/cohort/.")
+    p.add_argument("--skip-note-filter", action="store_true",
+                   help="do not require a discharge note (the Demo has no notes)")
+    p.add_argument("--no-demo-exclusion", action="store_true",
+                   help="keep Demo subjects (only for testing on the Demo itself)")
+    p.add_argument("--pool-fraction", type=float, help="override cohort.pool_fraction")
+    p.add_argument("--n-dev", type=int, help="override cohort.n_dev")
+    p.add_argument("--n-test", type=int, help="override cohort.n_test")
+    p.add_argument("--overwrite", action="store_true", help="replace existing id lists and hashes")
     add("build-units", cmd_build_units,
         "Phase 2: build evidence units and headers for admissions in config/selected_admissions.yaml.")
     p = add("retrieve", cmd_retrieve, "Phase 3: per-section hybrid retrieval for the selected admissions.")

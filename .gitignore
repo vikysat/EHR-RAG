@@ -17,3 +17,7 @@ __pycache__/
 # Local-only instruction files (never commit)
 /SPEC.md
 /CLAUDE.md
+
+# Cohort id lists live in cohort.out_dir (under /data/); only their SHA-256 hashes are committed
+/config/cohort/*
+!/config/cohort/*.sha256
