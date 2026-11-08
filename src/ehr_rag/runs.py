@@ -56,6 +56,15 @@ def _git_commit(root: Path) -> str | None:
     return res.stdout.strip() or None
 
 
+def _checker_hashes(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """Hashes of the frozen checker rules, lexicon and rewrite prompt (``checker.rules.checker_hashes``)."""
+    if "checker" not in cfg:
+        return None
+    from ehr_rag.checker.rules import checker_hashes
+
+    return checker_hashes(cfg)
+
+
 def make_run_id(name: str, now: datetime | None = None) -> str:
     """Build ``YYYYMMDD-HHMMSS-<name>``."""
     if not _NAME_RE.match(name):
@@ -127,6 +136,7 @@ def start_run(
         "platform": platform.platform(),
         "git_commit": _git_commit(project_root(cfg)),
         "packages": _package_versions(),
+        "checker": _checker_hashes(cfg),
     }
     run = Run(run_id=run_id, path=path, meta=meta)
     run.write_json("run_meta.json", meta)

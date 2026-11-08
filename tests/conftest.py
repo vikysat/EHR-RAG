@@ -91,6 +91,8 @@ def fake_config(tmp_path: Path) -> Path:
     cfg = yaml.safe_load((REPO / "config" / "default.yaml").read_text(encoding="utf-8"))
     cfg["data"]["root"] = str(tmp_path / "fake_mimic")
     cfg["data"]["derived"] = str(tmp_path / "derived")
+    cfg["checker"]["rules"] = str(REPO / "config" / "checker.yaml")
+    cfg["checker"]["lexicon"] = str(REPO / "config" / "checker_lexicon.yaml")
     (tmp_path / "config").mkdir()
     p = tmp_path / "config" / "test.yaml"
     p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
@@ -111,7 +113,7 @@ def env(fake_config: Path) -> dict[str, Any]:
     cfg = load_config(fake_config)
     root = Path(cfg["_project_root"])
     (root / "prompts").mkdir()
-    for p in (REPO / "prompts").glob("report_v1*.txt"):
+    for p in (REPO / "prompts").glob("*.txt"):
         (root / "prompts" / p.name).write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
     out = units_dir(Path(cfg["data"]["derived"]))
     build_all(load_tables(cfg), HADM, cfg["units"], out)

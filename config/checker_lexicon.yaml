@@ -1,0 +1,134 @@
+# Citation-checker LEXICON (frozen before the test run; its SHA-256 is recorded in every run's
+# run_meta.json). The checker's base vocabulary is built from the admission's own evidence
+# units (lab labels, drug names, diagnosis and procedure titles); this file adds synonyms,
+# common abbreviations and lab-derived terms. Forms of a group are interchangeable. A form of
+# at most 4 characters that contains a capital letter (K, Na, Cr, Hgb, WBC, INR, pH) is
+# matched case-sensitively in sentences; everything else case-insensitively.
+version: 1
+
+# Lab synonym groups. A lab unit belongs to the group whose form matches its label best
+# (longest match: "Lactate Dehydrogenase (LD)" is ldh, not lactate).
+labs:
+  potassium: [potassium, K, K+]
+  sodium: [sodium, Na, Na+]
+  chloride: [chloride, Cl]
+  bicarbonate: [bicarbonate, bicarb, HCO3, serum bicarbonate]
+  creatinine: [creatinine, Cr, Creat, serum creatinine]
+  urea nitrogen: [urea nitrogen, BUN, blood urea nitrogen]
+  hemoglobin: [hemoglobin, Hgb, Hb]
+  hematocrit: [hematocrit, Hct]
+  white blood cells: [white blood cells, white blood cell, white blood cell count, wbc count, WBC, WBCs, white count, leukocyte count]
+  platelet: [platelet, platelets, platelet count, Plt, PLT]
+  inr: [INR, inr pt]
+  ptt: [PTT, partial thromboplastin time]
+  glucose: [glucose, Glu, blood glucose, blood sugar]
+  magnesium: [magnesium, Mg]
+  calcium: [calcium, Ca, calcium total, free calcium, ionized calcium]
+  phosphate: [phosphate, phosphorus, Phos]
+  albumin: [albumin, Alb]
+  ast: [AST, aspartate aminotransferase, asparate aminotransferase, SGOT]
+  alt: [ALT, alanine aminotransferase, SGPT]
+  alkaline phosphatase: [alkaline phosphatase, Alk Phos, ALP]
+  bilirubin: [bilirubin, total bilirubin, bilirubin total, Tbili, T bili, bili]
+  lactate: [lactate, lactic acid]
+  troponin: [troponin, troponin t, Trop, TnT]
+  creatine kinase: [creatine kinase, CK, CPK]
+  ck-mb: [creatine kinase mb isoenzyme, ck-mb, CK-MB, ck-mb index]
+  ntprobnp: [ntprobnp, nt-probnp, BNP, pro-bnp, probnp]
+  lipase: [lipase]
+  ldh: [lactate dehydrogenase, LDH, LD]
+  hemoglobin a1c: [hemoglobin a1c, HbA1c, A1c]
+  ph: [pH]
+  pco2: [pCO2, PaCO2]
+  po2: [pO2, PaO2]
+
+# Diagnosis synonym groups (matched against diagnosis / history / procedure titles).
+# Lab-derived diagnoses (AKI, anemia, hyponatremia, ...) are under `terms` instead: there
+# they are supported by a cited diagnosis title OR by a cited lab with the right direction.
+diagnoses:
+  chronic kidney disease: [CKD, chronic kidney disease]
+  heart failure: [CHF, HFrEF, HFpEF, congestive heart failure, heart failure]
+  copd: [COPD, chronic obstructive pulmonary disease]
+  hypertension: [HTN, hypertension]
+  diabetes: [DM, T2DM, DM2, diabetes mellitus, diabetes]
+  coronary artery disease: [CAD, coronary artery disease, coronary atherosclerosis]
+  atrial fibrillation: [AF, AFib, afib, atrial fibrillation]
+  urinary tract infection: [UTI, urinary tract infection]
+  pneumonia: [pneumonia, PNA]
+  myocardial infarction: [MI, NSTEMI, STEMI, myocardial infarction]
+  deep vein thrombosis: [DVT, deep vein thrombosis, deep venous thrombosis]
+  hyperlipidemia: [HLD, hyperlipidemia]
+  gerd: [GERD, esophageal reflux, gastroesophageal reflux]
+  sepsis: [sepsis, septicemia]
+
+# Drug synonym groups (brand names and abbreviations of common hospital drugs)
+drugs:
+  normal saline: [normal saline, NS, 0.9% sodium chloride, sodium chloride 0.9%]
+  acetaminophen: [acetaminophen, tylenol, APAP]
+  furosemide: [furosemide, lasix]
+  hydromorphone: [hydromorphone, dilaudid]
+  vancomycin: [vancomycin, vanc]
+  potassium chloride: [potassium chloride, KCl]
+  insulin: [insulin]
+  heparin: [heparin]
+  warfarin: [warfarin, coumadin]
+
+# Lab-derived terms: each implies a lab and a direction. "labs" are lab-group keys above;
+# "fluid" restricts the lab units used (MIMIC d_labitems.fluid). A term is also supported
+# by a cited diagnosis / history unit whose title contains one of its forms (e.g. the ICD
+# title "Hyperpotassemia"); then no lab direction is checked.
+terms:
+  hyperkalemia: {labs: [potassium], direction: high, fluid: Blood, forms: [hyperkalemia, hyperkalaemia, hyperpotassemia]}
+  hypokalemia: {labs: [potassium], direction: low, fluid: Blood, forms: [hypokalemia, hypokalaemia, hypopotassemia]}
+  hypernatremia: {labs: [sodium], direction: high, fluid: Blood, forms: [hypernatremia, hypernatraemia]}
+  hyponatremia: {labs: [sodium], direction: low, fluid: Blood, forms: [hyponatremia, hyponatraemia, hyposmolality]}
+  anemia: {labs: [hemoglobin, hematocrit], direction: low, fluid: Blood, forms: [anemia, anaemia, anemic]}
+  leukocytosis: {labs: [white blood cells], direction: high, fluid: Blood, forms: [leukocytosis]}
+  leukopenia: {labs: [white blood cells], direction: low, fluid: Blood, forms: [leukopenia, leucopenia]}
+  thrombocytopenia: {labs: [platelet], direction: low, fluid: Blood, forms: [thrombocytopenia]}
+  thrombocytosis: {labs: [platelet], direction: high, fluid: Blood, forms: [thrombocytosis]}
+  hyperglycemia: {labs: [glucose], direction: high, fluid: Blood, forms: [hyperglycemia, hyperglycaemia]}
+  hypoglycemia: {labs: [glucose], direction: low, fluid: Blood, forms: [hypoglycemia, hypoglycaemia]}
+  acute kidney injury: {labs: [creatinine], direction: high, fluid: Blood, forms: [AKI, acute kidney injury, acute kidney failure, acute renal failure]}
+  hyperlactatemia: {labs: [lactate], direction: high, fluid: Blood, forms: [hyperlactatemia, lactic acidosis]}
+  troponinemia: {labs: [troponin], direction: high, fluid: Blood, forms: [troponinemia, troponin leak, troponin elevation]}
+  transaminitis: {labs: [ast, alt], direction: high, fluid: Blood, forms: [transaminitis, elevated transaminases, elevated lfts]}
+  hypoalbuminemia: {labs: [albumin], direction: low, fluid: Blood, forms: [hypoalbuminemia, hypoalbuminaemia]}
+  coagulopathy: {labs: [inr, ptt], direction: high, fluid: Blood, forms: [coagulopathy, supratherapeutic inr]}
+  hypomagnesemia: {labs: [magnesium], direction: low, fluid: Blood, forms: [hypomagnesemia, hypomagnesaemia]}
+  hypermagnesemia: {labs: [magnesium], direction: high, fluid: Blood, forms: [hypermagnesemia]}
+  hypocalcemia: {labs: [calcium], direction: low, fluid: Blood, forms: [hypocalcemia, hypocalcaemia]}
+  hypercalcemia: {labs: [calcium], direction: high, fluid: Blood, forms: [hypercalcemia, hypercalcaemia]}
+  hyperbilirubinemia: {labs: [bilirubin], direction: high, fluid: Blood, forms: [hyperbilirubinemia, hyperbilirubinaemia]}
+  hypophosphatemia: {labs: [phosphate], direction: low, fluid: Blood, forms: [hypophosphatemia]}
+  hyperphosphatemia: {labs: [phosphate], direction: high, fluid: Blood, forms: [hyperphosphatemia]}
+  azotemia: {labs: [urea nitrogen], direction: high, fluid: Blood, forms: [azotemia, uremia]}
+  acidemia: {labs: [ph], direction: low, fluid: Blood, forms: [acidemia]}
+  alkalemia: {labs: [ph], direction: high, fluid: Blood, forms: [alkalemia]}
+  hypercapnia: {labs: [pco2], direction: high, fluid: Blood, forms: [hypercapnia, hypercarbia]}
+
+# For "improving" / "worsening": the direction in which this lab gets worse.
+# Labs not listed: only the two-measurement requirement is checked for those words.
+worse_direction:
+  creatinine: up
+  urea nitrogen: up
+  white blood cells: up
+  lactate: up
+  troponin: up
+  bilirubin: up
+  ast: up
+  alt: up
+  inr: up
+  ntprobnp: up
+  hemoglobin: down
+  hematocrit: down
+  platelet: down
+  albumin: down
+
+# Words never used on their own as names derived from unit text (drug-name first words,
+# generic container names). Compared after normalization.
+name_stopwords: [bag, soln, solution, vial, syringe, sw, sterile, water, iso, osmotic, iso-osmotic, flush,
+                 sodium, potassium, calcium, magnesium, chloride, sulfate, gluconate, phosphate, dextrose,
+                 other, unspecified, total, blood, urine, whole, calculated, free, serum, count,
+                 replacement, critical, care, oncology, immediate, release, mini, plus, gel, tab, cap,
+                 history, personal, encounter, pt]

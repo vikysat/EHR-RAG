@@ -73,6 +73,11 @@ eval:
   bertscore_model: roberta-large   # text-metrics --bertscore; local HF cache only (offline)
   bertscore_layer: 17             # bert-score's default layer for roberta-large
 
+checker:                       # citation checker + enforcement; frozen, hashes in every run_meta.json
+  rules: config/checker.yaml
+  lexicon: config/checker_lexicon.yaml
+  rewrite_prompt: rewrite_v1   # prompts/rewrite_v1.txt (one-sentence rewrite)
+
 perturbation:
   n_targets: 15
   max_targets_per_admission: 2

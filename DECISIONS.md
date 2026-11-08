@@ -196,3 +196,38 @@ better than it is, never guesses, and keeps the raw data for manual review.
   ordered by condition and hadm_id before scoring, so the metrics and the seeded
   manual-review sample are identical to one unsharded run (tested). The same
   (condition, admission) in two runs is an error. `select-targets` still takes one run.
+
+## Citation checker (deterministic)
+
+Rules are in `config/checker.yaml`, vocabulary in `config/checker_lexicon.yaml`; the
+full definitions are in `src/ehr_rag/checker/rules.py`. Choices where the task left room:
+
+- **Valid ids** are those in `evidence_shown.json` (what the model saw), as in evaluation.
+- **List items keep the opening words** (the first item's text before its first number or
+  name). This differs on purpose from evaluation's claim split, which does not repeat the
+  lead-in; evaluation is unchanged.
+- **Numbers:** a stated number matches if it equals a number in a cited unit's text, or if
+  the unit value rounded half-up to the stated decimals equals it (5.94 → "5.9", 5.9 →
+  "6"). More precision than the unit (5.94 for 5.9) fails. Besides ages, dates and
+  section/list numbers, durations ("5 days", "hospital day 3") and ICD versions are
+  ignored: durations come from the non-citable header and would otherwise always fail.
+- **Names** come from the admission's own units (lab labels, drug names, diagnosis and
+  procedure titles and simple variants) plus lexicon synonyms. A drug or diagnosis that is
+  in no unit of the admission and not in the lexicon is not detected (limits coverage).
+  Short abbreviations with capitals (K, Na, Cr, pH) are case-sensitive.
+- **Directions** use the shown points' [HIGH]/[LOW] markers. With a stated number, that
+  point decides; otherwise high/low hold if any shown point is marked, normal if every
+  cited unit's last point is unmarked. Labs without a reference range are not checkable.
+  A lab name supported only by a non-lab unit (the drug Potassium Chloride) plus a
+  direction word fails.
+- **Trends (adapted):** there is one lab unit per lab per admission, so "two cited units
+  of the same lab" would almost never exist. A trend word needs >= 2 shown measurements of
+  that lab at different times across the cited units (usually first and last of one
+  unit); latest minus earliest must have the word's sign.
+- **Lab-derived terms** (hyperkalemia, AKI, anemia, ...) are supported by a cited lab of the
+  right group, whose direction is then checked, or by a cited diagnosis title containing
+  the term (then no direction check).
+- **Negation:** a cue (no, not, without, negative for, ...) within 3 tokens before the
+  direction word or the name flips the claim.
+- **Status:** fail (any error), pass (no error, something checkable), unchecked (nothing
+  checkable). Unchecked lines are reported separately as checker coverage.
