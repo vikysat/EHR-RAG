@@ -89,6 +89,10 @@ Every command that produces results writes `runs/<YYYYMMDD-HHMMSS-name>/`, conta
 | 12 | `select-targets --generation-run <id>` | CPU | `candidates.csv`, `targets.csv`, `edits.jsonl`, `skipped_edits.csv` |
 | 13 | `run-pilot --targets-run <id>` | GPU (`scripts/cli.sbatch`) | frozen-evidence regenerations per edit + controls: `cases/<case_id>/...`, `cases.csv` |
 | 14 | `analyze-perturbation --pilot-run <id>` | CPU | `perturbation_results.csv`, `perturbation_summary.md`, `perturbation_manual_check.csv`, `diffs/` |
+| 14a | `audit-targets --generation-run <id...>` | CPU | counterfactual audit targets: per admission up to 3 cited labs (flagged first) + 1 uncited null-edit lab; edits to the other side of the reference range: `audit_targets.csv`, `audit_edits.jsonl`, `audit_skips.csv` |
+| 14b | `run-audit --targets-run <id>` | GPU (`scripts/audit_array.sbatch`) | regenerations with the edited unit in the frozen evidence, for `ehr_rag` and `ehr_rag_enforced` (frozen checker + rewrite); shardable over admissions |
+| 14c | `analyze-audit --audit-run <id...>` | CPU | Follows / Stale / Dropped / Other per (original claim, edited unit); faithfulness with 95% bootstrap CIs (paired plain vs enforced); term survival; null-edit churn; `audit_manual_check.csv` (50 pairs) |
+| 16 | `make-tables [--evaluate-run] [--manual-labels] [--check-run] [--text-metrics-run] [--audit-run]` | CPU | the paper's tables as markdown with 95% CIs: `tables.md`, `table_*.md` |
 | 15 | `notebooks/demo.ipynb` | any | one admission end to end from cached runs; no model calls |
 
 `generate` and `run-pilot` print the number of calls and the estimated input tokens

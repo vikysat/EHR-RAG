@@ -447,3 +447,62 @@ sbatch scripts/cli.sbatch evaluate --config config/full.yaml --generation-run $T
 repair vs retreat and the share of lines and numbers kept after enforcement.
 `evaluate`: NLI and manual-review metrics for every condition including the enforced and
 filtered ones; it never uses the checker.
+
+---
+
+## 12. Counterfactual citation audit, then the paper tables
+
+Needs the plain `ehr_rag` reports of a generation run (10.6 for dev, 11.4 for test) and the
+frozen checker hash `CHECKER_SHA` (11.2). Shards: 25 admissions each; dev = 1 shard, test = 4.
+
+### 12.1 Dev first (checks the pipeline and calibrates the GPU time)
+
+```bash
+DEV_SHARDS=$(ls runs | grep -- "-generate-job<dev jobid>-shard")
+python -m ehr_rag.cli audit-targets --config config/full.yaml --generation-run $DEV_SHARDS   # -> AUDIT_TARGETS_DEV
+sbatch --array=0 scripts/audit_array.sbatch --config config/full.yaml --targets-run <AUDIT_TARGETS_DEV> \
+    --checker-sha256 $CHECKER_SHA --yes
+python -m ehr_rag.cli analyze-audit --config config/full.yaml \
+    --audit-run $(ls runs | grep -- "-run-audit-job<dev audit jobid>-shard")                     # -> AUDIT_DEV
+```
+Check `audit-targets` output (targets per kind, edit types, skip reasons); the head of each
+shard's `stdout.log` (the call plan: distinct prompts, cached / new); and fill
+`runs/<AUDIT_DEV>/audit_manual_check.csv` (`human_label`) to validate the automatic labels.
+
+GPU time per call, measured on the dev run (counts and seconds only):
+```bash
+python - <<'EOF'
+import json, glob, statistics
+runs = sorted(glob.glob("runs/*-run-audit-job*-shard*"))
+s = [a["seconds"] for p in glob.glob(runs[-1] + "/*/*/call.json") for a in json.load(open(p))["attempts"] if not a["cached"]]
+r = [ln["rewrite_call"]["seconds"] for p in glob.glob(runs[-1] + "/ehr_rag_enforced/*/enforcement.json")
+     for ln in json.load(open(p))["lines"] if "rewrite_call" in ln and not ln["rewrite_call"]["cached"]]
+print(f"report calls {len(s)}, mean {statistics.mean(s) if s else 0:.1f}s; "
+      f"rewrite calls {len(r)}, mean {statistics.mean(r) if r else 0:.1f}s")
+EOF
+```
+
+### 12.2 Test (100 admissions, 4 shards)
+
+```bash
+TEST_SHARDS=$(ls runs | grep -- "-generate-job<test jobid>-shard")
+python -m ehr_rag.cli audit-targets --config config/full.yaml --generation-run $TEST_SHARDS  # -> AUDIT_TARGETS_TEST
+sbatch --array=0-3 scripts/audit_array.sbatch --config config/full.yaml --targets-run <AUDIT_TARGETS_TEST> \
+    --checker-sha256 $CHECKER_SHA --yes
+python -m ehr_rag.cli analyze-audit --config config/full.yaml \
+    --audit-run $(ls runs | grep -- "-run-audit-job<test audit jobid>-shard")                    # -> AUDIT_TEST
+```
+
+### 12.3 All tables for the test set
+
+```bash
+sbatch scripts/cli.sbatch evaluate --config config/full.yaml --generation-run $TEST_SHARDS        # -> EVAL_TEST
+python -m ehr_rag.cli check-citations --config config/full.yaml --generation-run $TEST_SHARDS \
+    --checker-sha256 $CHECKER_SHA                                                                 # -> CHECK_TEST
+sbatch scripts/cli.sbatch text-metrics --config config/full.yaml --generation-run $TEST_SHARDS \
+    --references data/cohort/reference/references.csv --bertscore                                 # -> TM_TEST
+python -m ehr_rag.cli make-tables --config config/full.yaml --evaluate-run <EVAL_TEST> \
+    --manual-labels runs/<EVAL_TEST>/manual_review_labeled.csv --check-run <CHECK_TEST> \
+    --text-metrics-run <TM_TEST> --audit-run <AUDIT_TEST>
+```
+The tables are in `runs/<MAKE_TABLES_RUN>/tables.md`; stdout shows row counts only.
