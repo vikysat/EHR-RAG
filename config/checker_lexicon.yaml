@@ -14,6 +14,10 @@ labs:
   chloride: [chloride, Cl]
   bicarbonate: [bicarbonate, bicarb, HCO3, serum bicarbonate]
   creatinine: [creatinine, Cr, Creat, serum creatinine]
+  # ratios and clearances are not creatinine: separate groups so the longest match wins
+  protein/creatinine ratio: [protein/creatinine ratio, protein creatinine ratio, UPCR]
+  albumin/creatinine ratio: [albumin/creatinine, albumin creatinine ratio, UACR]
+  creatinine clearance: [creatinine clearance, CrCl]
   urea nitrogen: [urea nitrogen, BUN, blood urea nitrogen]
   hemoglobin: [hemoglobin, Hgb, Hb]
   hematocrit: [hematocrit, Hct]

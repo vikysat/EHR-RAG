@@ -113,9 +113,11 @@ def form_pattern(form: str, plural: bool = False) -> re.Pattern[str]:
     case_sensitive = len(raw.replace("+", "")) <= 4 and any(c.isupper() for c in raw)
     toks = re.findall(r"[A-Za-z0-9]+(?:\.[0-9]+)?%?", raw)
     body = r"[\W_]+".join(re.escape(t) for t in toks)
-    if plural and not case_sensitive:
+    if case_sensitive:      # short abbreviations never touch a '/': the K in "K/uL" is a unit, not potassium
+        return re.compile(rf"(?<![A-Za-z0-9/]){body}(?![A-Za-z0-9/])")
+    if plural:
         body += "(?:s|es)?"
-    return re.compile(rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])", 0 if case_sensitive else re.IGNORECASE)
+    return re.compile(rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])", re.IGNORECASE)
 
 
 def _phrase_regex(words: list[str]) -> re.Pattern[str]:

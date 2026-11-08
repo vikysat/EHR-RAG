@@ -178,3 +178,47 @@ def test_checker_is_deterministic() -> None:
     a = check("Labs showed low Na 128 [E2], K 4.3 [E1].", units=units).to_dict()
     b = check("Labs showed low Na 128 [E2], K 4.3 [E1].", units=units, ck=checker()).to_dict()
     assert a == b
+
+
+# --------------------------------------------------------------------------- tricky cases
+
+
+@pytest.mark.parametrize("line,status,types", [
+    # units of measure are not names: the K in K/uL is not potassium, mg is not Mg
+    ("WBC was 6.8 K/uL. [E6]", "pass", []),
+    ("Glucose was 105 mg/dL. [E10]", "pass", []),
+    # drug names that contain lab words are drugs (longest match), with abbreviations
+    ("Potassium chloride 40 mg was given. [E4]", "pass", []),
+    ("KCl 40 mg IV was given. [E4]", "pass", []),
+    # numbers: thousands separators, dosing frequencies, hospital days, ISO dates
+    ("Sodium 1,280 was recorded. [E2]", "fail", ["number_mismatch"]),
+    ("Potassium chloride was given q6h. [E4]", "pass", []),
+    ("On hospital day 3 Na was 128. [E2]", "pass", []),
+    ("Potassium was 5.9 on 2150-03-02 08:00. [E1]", "pass", []),
+    # negation scope: the cue must be close to the claim
+    ("No change in management; potassium was elevated. [E1]", "pass", []),
+    ("Without hyponatremia. [E2]", "fail", ["direction_mismatch"]),
+    # list sentences: per-item citations, opening words, uncited tail
+    ("Na 128 [E2], K 4.3 [E1].", "pass", []),
+    ("Labs: Na 128 [E2], K 5.9 [E1], Cr 9.9 [E3].", "fail", ["number_mismatch"]),
+    ("Labs showed elevated K 5.9 [E1] and Cr 2.4 [E3].", "pass", []),
+    ("Na 128 [E2] and K 6.6 afterwards.", "fail", ["number_mismatch", "name_missing"]),
+    # nothing checkable
+    ("Continue current management. [E1]", "unchecked", []),
+    ("Follow up with the primary care physician. [E5]", "unchecked", []),
+])
+def test_tricky_cases(line: str, status: str, types: list[str]) -> None:
+    lc = check(line)
+    assert (lc.status, lc.error_types) == (status, types), lc.messages()
+
+
+def test_rounding_both_ways() -> None:
+    from decimal import Decimal
+
+    ck = checker()
+    assert ck.number_matches(Decimal("5.9"), [Decimal("5.94")])          # rounded down
+    assert ck.number_matches(Decimal("6.0"), [Decimal("5.95")])          # half-up
+    assert ck.number_matches(Decimal("6"), [Decimal("5.9")])
+    assert not ck.number_matches(Decimal("5.8"), [Decimal("5.85")])     # 5.85 rounds half-up to 5.9
+    assert not ck.number_matches(Decimal("5.94"), [Decimal("5.9")])      # more precision than the unit
+    assert ck.number_matches(Decimal("1200"), [Decimal("1200")])
