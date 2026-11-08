@@ -829,6 +829,49 @@ def cmd_audit_targets(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run_audit(args: argparse.Namespace) -> int:
+    """Counterfactual audit regenerations (GPU): plain ehr_rag and/or ehr_rag_enforced, shardable."""
+    from ehr_rag.config import validate_for_generation
+    from ehr_rag.generation.backends import BackendError, gpu_name, make_backend
+    from ehr_rag.generation.generate import ConfirmationRequired, GenerationError
+    from ehr_rag.perturb.run_pilot import PilotError, audit_admissions, run_audit
+    from ehr_rag.runs import check_frozen_checker, start_run
+
+    cfg = load_config(args.config)
+    validate_for_generation(cfg)
+    tdir = _run_dir(cfg, args.targets_run, "audit-targets")
+    hadm_ids, shard_info = shard(audit_admissions(tdir), args.shard_size, args.shard_index)
+    check_frozen_checker(cfg, args.checker_sha256)
+    run = start_run(cfg, "run-audit", command="run-audit", seed=cfg["audit"]["seed"], run_id=args.run_id)
+    gen = cfg["generation"]
+    run.meta.update(targets_run=args.targets_run, conditions=args.conditions, backend=gen["backend"],
+                    model=gen["model"], gpu_name=gpu_name(), hf_hub_offline=os.environ.get("HF_HUB_OFFLINE"),
+                    hadm_ids=hadm_ids, **shard_info)
+    run.write_json("run_meta.json", run.meta)
+    print(f"run: {run.path}")
+    try:
+        res = run_audit(cfg, tdir, run, make_backend(gen), conditions=args.conditions, hadm_ids=hadm_ids,
+                        yes=args.yes, no_cache=args.no_cache)
+    except ConfirmationRequired as e:
+        print(f"NOT RUN: {e}")
+        run.finish(status="not_confirmed")
+        return 5
+    except (BackendError, GenerationError, PilotError, OSError, ValueError) as e:
+        print(f"STOP - audit failed: {e}", file=sys.stderr)
+        run.finish(status="failed", error=repr(e))
+        return 4
+    except BaseException as e:
+        run.finish(status="failed", error=repr(e))
+        raise
+    print(f"\ncases: {res['n_cases']}; format status: {res['statuses']}; model calls: {res['n_api_calls']}; "
+          f"cache hits: {res['n_cache_hits']}")
+    run.finish(model_revision=res["model_revision"], reported_model_ids=res["reported_models"],
+               format_counts=res["statuses"], n_cases=res["n_cases"], n_api_calls=res["n_api_calls"],
+               n_cache_hits=res["n_cache_hits"])
+    print(f"run: {run.path}")
+    return 0
+
+
 def cmd_run_pilot(args: argparse.Namespace) -> int:
     """Phase 6: regenerate with frozen evidence for every edit and control."""
     from ehr_rag.config import validate_for_generation
@@ -1009,6 +1052,17 @@ def build_parser() -> argparse.ArgumentParser:
             "edited to the other side of the reference range.")
     p.add_argument("--generation-run", required=True, nargs="+", help="run id(s) with plain ehr_rag reports")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
+    p = add("run-audit", cmd_run_audit,
+            "Counterfactual audit regenerations with the edited unit in the frozen evidence (plain and enforced).")
+    p.add_argument("--targets-run", required=True, help="run id of an `audit-targets` run")
+    p.add_argument("--conditions", nargs="+", default=["ehr_rag", "ehr_rag_enforced"],
+                   choices=["ehr_rag", "ehr_rag_enforced"], help="default: both")
+    p.add_argument("--shard-size", type=int, help="admissions per shard (with --shard-index)")
+    p.add_argument("--shard-index", type=int, help="0-based shard of the admission list")
+    p.add_argument("--checker-sha256", help="refuse to run unless the checker files' combined sha256 equals this")
+    p.add_argument("--yes", action="store_true", help="confirm when new calls exceed generation.confirm_threshold")
+    p.add_argument("--no-cache", action="store_true", help="bypass the response cache (fresh calls)")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name> (used by scripts/audit_array.sbatch)")
     p = add("run-pilot", cmd_run_pilot,
             "Phase 6: frozen-evidence regenerations for every edit plus unperturbed controls.")
     p.add_argument("--targets-run", required=True, help="run id of a `select-targets` run")

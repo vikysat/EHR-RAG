@@ -298,3 +298,144 @@ def select_audit(cfg: dict[str, Any], gen_dirs: list[Path], run: Run) -> dict[st
     for s in skips:
         reasons[s["reason"]] = reasons.get(s["reason"], 0) + 1
     return {"n_admissions": len(where), "targets": targets, "edits": edits, "skips": skips, "skip_reasons": reasons}
+
+
+# --------------------------------------------------------------------------- counterfactual audit: regeneration
+
+AUDIT_CONDITIONS: tuple[str, ...] = ("ehr_rag", "ehr_rag_enforced")
+AUDIT_CASE_COLUMNS = ["case_id", "condition", "kind", "hadm_id", "target_id", "unit_id", "status", "n_dropped",
+                      "n_repaired", "n_retreated"]
+
+
+@dataclasses.dataclass
+class AuditCase:
+    """One audit regeneration: the unedited original or one edited target, for one condition."""
+
+    case_id: str           # "<hadm_id>__original" or the target id
+    condition: str         # ehr_rag | ehr_rag_enforced
+    kind: str              # original | cited | null
+    hadm_id: int
+    target_id: str
+    unit_id: str
+    job: Job
+    all_units: list[EvidenceUnit]   # the admission's units with the edited unit replaced (checker vocabulary)
+
+
+def audit_admissions(targets_dir: Path) -> list[int]:
+    """Admissions of an audit-targets run, sorted (the unit of sharding)."""
+    with (targets_dir / "audit_targets.csv").open(encoding="utf-8", newline="") as f:
+        return sorted({int(r["hadm_id"]) for r in csv.DictReader(f)})
+
+
+def _swap(units: list[EvidenceUnit], edit: dict[str, Any]) -> list[EvidenceUnit]:
+    return [dataclasses.replace(u, fields=edit["edited_fields"], text=edit["edited_text"])
+            if u.unit_id == edit["unit_id"] else u for u in units]
+
+
+def build_audit_cases(cfg: dict[str, Any], targets_dir: Path, backend: Backend, conditions: list[str],
+                      hadm_ids: list[int]) -> list[AuditCase]:
+    """Frozen-evidence jobs: per admission and condition, the original plus one job per edited target.
+
+    The evidence is the original ``evidence_shown.json`` order; only the target unit's fields and
+    text change. The unperturbed prompt must rebuild byte-identical to the original prompt.txt.
+    """
+    root = project_root(cfg)
+    meta = _read_json(targets_dir / "audit_meta.json")
+    templates = load_templates(root / "prompts", cfg["generation"]["prompt_version"])
+    udir = units_dir(resolve_path(cfg, cfg["data"]["derived"]))
+    with (targets_dir / "audit_targets.csv").open(encoding="utf-8", newline="") as f:
+        targets = list(csv.DictReader(f))
+    edits = {e["target_id"]: e for e in (json.loads(x) for x in
+             (targets_dir / "audit_edits.jsonl").read_text(encoding="utf-8").splitlines() if x.strip())}
+    cases: list[AuditCase] = []
+    for h in hadm_ids:
+        gen_dir = root / "runs" / meta["generation_runs"][str(h)]
+        _, shown = original_report(gen_dir, h, "ehr_rag")
+        all_units = read_units(udir / f"{h}.jsonl")
+        base = frozen_units(shown, all_units)
+        header = read_header(udir, h)
+        orig_prompt = build_prompt(templates, header, base)
+        if orig_prompt != (gen_dir / "ehr_rag" / str(h) / "prompt.txt").read_text(encoding="utf-8"):
+            raise PilotError(f"hadm {h}: rebuilt unperturbed prompt differs from the original prompt.txt "
+                             "(template, header or evidence changed); refusing to run")
+        jobs = [("original", "", "", orig_prompt, base, all_units)]
+        for t in [t for t in targets if int(t["hadm_id"]) == h]:
+            e = edits[t["target_id"]]
+            ev = _swap(base, e)
+            jobs.append((t["kind"], t["target_id"], t["unit_id"], build_prompt(templates, header, ev), ev,
+                         _swap(all_units, e)))
+        for cond in conditions:
+            for kind, tid, uid, prompt, ev, au in jobs:
+                n, exact = backend.count_tokens(prompt)
+                cid = f"{h}__original" if kind == "original" else tid
+                cases.append(AuditCase(cid, cond, kind, h, tid, uid, Job(cond, h, prompt, ev, n, exact), au))
+    return cases
+
+
+def run_audit(
+    cfg: dict[str, Any], targets_dir: Path, run: Run, backend: Backend, *, conditions: list[str],
+    hadm_ids: list[int], yes: bool = False, no_cache: bool = False, log: Callable[[str], None] = print,
+) -> dict[str, Any]:
+    """Regenerate every audit case, printing the expected number of model calls first."""
+    bad = [c for c in conditions if c not in AUDIT_CONDITIONS]
+    if bad:
+        raise PilotError(f"audit conditions must be among {list(AUDIT_CONDITIONS)}, got {bad}")
+    gen = cfg["generation"]
+    root = project_root(cfg)
+    cases = build_audit_cases(cfg, targets_dir, backend, conditions, hadm_ids)
+    if not cases:
+        raise PilotError("no audit cases: no targets for these admissions")
+    params = {"temperature": gen["temperature"], "max_tokens": gen["max_tokens"], "base_url": gen["base_url"]}
+    g = Generator(backend, ResponseCache(root / "cache" / "generation"), params, no_cache=no_cache)
+    g.revision = backend.revision()
+    prompts = list(dict.fromkeys(c.job.prompt for c in cases))
+    n_cached = 0 if no_cache else sum(g.cache.has(g.key(p)) for p in prompts)
+    n_new = len(prompts) - n_cached
+    n_targets = len({c.target_id for c in cases if c.kind != "original"})
+    n_enf = sum(1 for c in cases if c.condition == "ehr_rag_enforced")
+    log(f"== Audit plan: {len(hadm_ids)} admissions, {n_targets} edited targets, conditions {conditions}")
+    log(f"  report jobs {len(cases)}; distinct prompts {len(prompts)} = expected report calls "
+        f"({n_cached} cached, {n_new} new; ehr_rag and ehr_rag_enforced share them); estimated input tokens "
+        f"{sum(backend.count_tokens(p)[0] for p in prompts):,}")
+    if n_enf:
+        log(f"  plus at most one rewrite call per failing line in the {n_enf} ehr_rag_enforced reports, "
+            "and at most one format retry per report")
+    if n_new > gen["confirm_threshold"] and not yes:
+        raise ConfirmationRequired(
+            f"{n_new} new calls exceed generation.confirm_threshold ({gen['confirm_threshold']}); re-run with --yes")
+    templates = load_templates(root / "prompts", gen["prompt_version"])
+    checker = template = checker_meta = None
+    if n_enf:
+        from ehr_rag.checker.enforce import load_rewrite_template
+        from ehr_rag.checker.rules import Checker, checker_hashes
+
+        checker = Checker.from_config(cfg)
+        template = load_rewrite_template(root / "prompts", cfg["checker"]["rewrite_prompt"])
+        checker_meta = checker_hashes(cfg)
+
+    def rewrite(prompt: str) -> tuple[str, dict[str, Any]]:
+        comp, m = g.call(prompt)
+        return comp.text, m
+
+    rows: list[dict[str, Any]] = []
+    statuses: dict[str, int] = {}
+    for i, c in enumerate(cases, 1):
+        d = run.path / c.condition / c.case_id
+        status = g.run_job(c.job, templates, d, retrieval_run=None)
+        statuses[status] = statuses.get(status, 0) + 1
+        row: dict[str, Any] = {"case_id": c.case_id, "condition": c.condition, "kind": c.kind, "hadm_id": c.hadm_id,
+                               "target_id": c.target_id, "unit_id": c.unit_id, "status": status}
+        if c.condition == "ehr_rag_enforced":
+            from ehr_rag.checker.enforce import enforce_dir
+
+            ctx = checker.admission(c.job.evidence, c.all_units)              # type: ignore[union-attr]
+            es = enforce_dir(d, ctx, checker, "rewrite", rewrite, template, checker_meta)   # type: ignore[arg-type]
+            row.update(n_dropped=es["n_dropped"], n_repaired=es["n_repaired"], n_retreated=es["n_retreated"])
+        _write_json(d / "case.json", row)
+        rows.append(row)
+        log(f"  [{i}/{len(cases)}] {c.condition} {c.case_id}: {status}")
+    _write_csv(run.path / "audit_cases.csv", rows, AUDIT_CASE_COLUMNS)
+    _write_json(run.path / "audit_run_meta.json", {"targets_run": targets_dir.name, "conditions": conditions,
+                                                   "hadm_ids": hadm_ids})
+    return {"n_cases": len(cases), "statuses": statuses, "n_api_calls": g.n_calls, "n_cache_hits": g.n_cache_hits,
+            "model_revision": g.revision, "reported_models": sorted(g.reported_models)}

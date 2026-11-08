@@ -197,3 +197,105 @@ def test_audit_targets_cli(env: dict[str, Any], capsys: pytest.CaptureFixture) -
     assert [e["edit_type"] for e in edits] == ["to_normal", "to_normal"]        # Fakeium is HIGH / LOW
     assert json.loads((run / "audit_meta.json").read_text(encoding="utf-8"))["generation_runs"] == {
         "12": gen.path.name, "21": gen.path.name}
+
+
+# --------------------------------------------------------------------------- task 3: regeneration
+
+
+def _base_run(env: dict[str, Any], responder: Any, conditions: list[str] | None = None) -> str:
+    from ehr_rag.generation.generate import run_generation
+    from ehr_rag.runs import start_run
+    from fakes import FakeBackend
+
+    gen = start_run(env["cfg"], "generate", command="generate")
+    run_generation(env["cfg"], gen, FakeBackend(responder), hadm_ids=[12, 21], conditions=conditions or ["ehr_rag"],
+                   retrieval_run=env["retrieval_run"], log=lambda s: None)
+    return gen.path.name
+
+
+def _targets(env: dict[str, Any], gen: str, run_id: str = "20990101-000000-audit-targets") -> Path:
+    from ehr_rag.cli import main
+
+    assert main(["audit-targets", "--config", str(env["root"] / "config" / "test.yaml"), "--generation-run", gen,
+                 "--run-id", run_id]) == 0
+    return env["root"] / "runs" / run_id
+
+
+def test_run_audit_plain_and_enforced(env: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                      capsys: pytest.CaptureFixture) -> None:
+    import json
+
+    import ehr_rag.generation.backends as backends
+    from ehr_rag.cli import main
+    from fakes import FakeBackend, realistic_responder
+
+    gen = _base_run(env, realistic_responder)
+    tdir = _targets(env, gen)
+    backend = FakeBackend(realistic_responder)
+    monkeypatch.setattr(backends, "make_backend", lambda g: backend)
+    cfg = str(env["root"] / "config" / "test.yaml")
+    capsys.readouterr()
+    assert main(["run-audit", "--config", cfg, "--targets-run", tdir.name, "--run-id", "20990101-000001-run-audit"]) == 0
+    out = capsys.readouterr().out
+    # 2 admissions x (original + 1 target) = 4 distinct prompts; the 2 originals are cache hits
+    assert "report jobs 8; distinct prompts 4 = expected report calls (2 cached, 2 new" in out
+    assert "at most one rewrite call per failing line in the 4 ehr_rag_enforced reports" in out
+    reports = [p for p in backend.prompts if not p.startswith("One sentence")]
+    assert len(reports) == 2                                    # only the 2 edited prompts were new calls
+    run = env["root"] / "runs" / "20990101-000001-run-audit"
+    edits = {json.loads(x)["target_id"]: json.loads(x) for x in
+             (tdir / "audit_edits.jsonl").read_text(encoding="utf-8").splitlines()}
+    for tid, e in edits.items():
+        d = run / "ehr_rag" / tid
+        orig = json.loads((run / "ehr_rag" / f"{e['hadm_id']}__original" / "evidence_shown.json").read_text(encoding="utf-8"))
+        shown = json.loads((d / "evidence_shown.json").read_text(encoding="utf-8"))
+        assert [u["unit_id"] for u in shown["units"]] == [u["unit_id"] for u in orig["units"]]   # retrieval held fixed
+        changed = [u["unit_id"] for u, o in zip(shown["units"], orig["units"]) if u["text"] != o["text"]]
+        assert changed == [e["unit_id"]] and e["edited_text"] in (d / "prompt.txt").read_text(encoding="utf-8")
+        assert (run / "ehr_rag_enforced" / tid / "enforcement.json").exists()
+        assert (run / "ehr_rag" / tid / "prompt.txt").read_text(encoding="utf-8") == \
+            (run / "ehr_rag_enforced" / tid / "prompt.txt").read_text(encoding="utf-8")       # same prompt
+    original = run / "ehr_rag" / "12__original" / "prompt.txt"
+    gen_prompt = env["root"] / "runs" / gen / "ehr_rag" / "12" / "prompt.txt"
+    assert original.read_text(encoding="utf-8") == gen_prompt.read_text(encoding="utf-8")
+    meta = json.loads((run / "run_meta.json").read_text(encoding="utf-8"))
+    assert meta["status"] == "ok" and meta["checker"]["combined_sha256"]
+
+
+def test_run_audit_shards_and_guards(env: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                     capsys: pytest.CaptureFixture) -> None:
+    import json
+
+    import ehr_rag.generation.backends as backends
+    from ehr_rag.cli import main
+    from fakes import FakeBackend, realistic_responder
+
+    gen = _base_run(env, realistic_responder)
+    tdir = _targets(env, gen)
+    monkeypatch.setattr(backends, "make_backend", lambda g: FakeBackend(realistic_responder))
+    cfg = str(env["root"] / "config" / "test.yaml")
+    base = ["run-audit", "--config", cfg, "--targets-run", tdir.name, "--conditions", "ehr_rag"]
+    for k in (0, 1):
+        assert main(base + ["--shard-size", "1", "--shard-index", str(k), "--run-id",
+                            f"20990101-00000{k}-run-audit-job9-shard{k}"]) == 0
+    m = [json.loads((env["root"] / "runs" / f"20990101-00000{k}-run-audit-job9-shard{k}" / "run_meta.json")
+                    .read_text(encoding="utf-8")) for k in (0, 1)]
+    assert [x["hadm_ids"] for x in m] == [[12], [21]] and m[0]["n_shards"] == 2
+    assert main(base + ["--shard-size", "1", "--shard-index", "2"]) == 2
+    assert main(base + ["--checker-sha256", "0" * 64]) == 2
+    assert "checker files changed" in capsys.readouterr().err
+
+
+def test_run_audit_refuses_changed_prompt(env: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                          capsys: pytest.CaptureFixture) -> None:
+    import ehr_rag.generation.backends as backends
+    from ehr_rag.cli import main
+    from fakes import FakeBackend, realistic_responder
+
+    gen = _base_run(env, realistic_responder)
+    tdir = _targets(env, gen)
+    p = env["root"] / "runs" / gen / "ehr_rag" / "12" / "prompt.txt"
+    p.write_text(p.read_text(encoding="utf-8") + "tampered", encoding="utf-8")
+    monkeypatch.setattr(backends, "make_backend", lambda g: FakeBackend(realistic_responder))
+    assert main(["run-audit", "--config", str(env["root"] / "config" / "test.yaml"), "--targets-run", tdir.name]) == 4
+    assert "differs from the original prompt.txt" in capsys.readouterr().err

@@ -283,3 +283,15 @@ full definitions are in `src/ehr_rag/checker/rules.py`. Choices where the task l
   clinically usual direction for these), flag "abnormal", `n_abnormal = n_measurements`.
   The value keeps the unit's precision; edits whose rounded value lands on the wrong side,
   or a non-positive low value, are skipped.
+- **Regeneration (`run-audit`):** per admission and condition, the unedited original (a cache
+  hit when the generation run used the same model) plus one report per target, with the
+  target's fields and text replaced inside the original `evidence_shown.json` order. The
+  rebuilt unperturbed prompt must equal the original `prompt.txt` byte for byte. Greedy
+  decoding, same template. `ehr_rag_enforced` shares the base call with `ehr_rag` (same
+  prompt) and then runs the frozen checker + one rewrite per failing line, with the checker
+  vocabulary built from the edited units (`--checker-sha256` guards the files). Running the
+  originals inside the audit run makes each run self-contained, and is how the enforced
+  originals exist even when the generation run had no `ehr_rag_enforced`.
+- **Sharding** is over admissions (`--shard-size` / `--shard-index`, `scripts/audit_array.sbatch`).
+  The printed plan counts distinct prompts (= report calls) with how many are cached;
+  rewrites and format retries are bounded but not known in advance.
