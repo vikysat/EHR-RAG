@@ -295,3 +295,27 @@ full definitions are in `src/ehr_rag/checker/rules.py`. Choices where the task l
 - **Sharding** is over admissions (`--shard-size` / `--shard-index`, `scripts/audit_array.sbatch`).
   The printed plan counts distinct prompts (= report calls) with how many are cached;
   rewrites and format retries are bounded but not known in advance.
+- **Pairs and labels (`analyze-audit`):** a pair is (an original claim citing the edited unit,
+  the edit), per condition; the original is that condition's unedited report from the audit run
+  (so enforced pairs come from the enforced original). Claims are the checker's, list items
+  keeping their opening words. Each pair is matched to the regenerated claim citing the same
+  id in the same section with the highest difflib ratio (then any section). Signals use the
+  checker's number and direction extraction: a number or direction claim that holds only for
+  the edited unit is a follows-signal; only for the original, a stale-signal. Follows = only
+  follows-signals; Stale = only stale-signals; Dropped = no regenerated claim cites the unit;
+  Other = cites it with neither or both. Consequence of the checker's normal rule (last point
+  unmarked): "potassium was normal" about a unit whose last value was already normal is not
+  discriminating and is Other. `original_states_value_or_direction` marks pairs whose
+  original claim stated a checkable value at all.
+- **Faithfulness** = Follows / (Follows + Stale), pooled over pairs; 95% CI from 1,000 bootstrap
+  resamples of admissions (`ehr_rag/stats.py`, seeded, percentile interval). Plain vs enforced
+  is paired: the difference is computed on the same resampled admissions (those with pairs in
+  both conditions).
+- **Lab-derived terms:** for to_normal edits, the lexicon terms of the unit's lab group and
+  original direction (hyperkalemia for a high potassium); present = named anywhere in the
+  original Impression + Recommendations; survives = still named after the edit.
+- **Null-edit churn:** per section, original non-abstention lines that do not appear verbatim
+  in the same section of the null-edited regeneration, and whether the edited uncited unit is
+  cited afterwards.
+- **Manual check:** 50 pairs, equal allocation over (condition, label) strata, round-robin,
+  seeded per stratum.

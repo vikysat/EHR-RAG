@@ -872,6 +872,44 @@ def cmd_run_audit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_analyze_audit(args: argparse.Namespace) -> int:
+    """Counterfactual audit labels and summaries (CPU). Counts and CIs only."""
+    from ehr_rag.config import project_root
+    from ehr_rag.perturb.analyze import analyze_audit
+    from ehr_rag.runs import start_run
+    from ehr_rag.stats import fmt_ci
+
+    cfg = load_config(args.config)
+    audit_dirs = [_run_dir(cfg, a, "run-audit") for a in args.audit_run]
+    run = start_run(cfg, "analyze-audit", command="analyze-audit", seed=cfg["audit"]["seed"], run_id=args.run_id)
+    try:
+        res = analyze_audit(cfg, audit_dirs, project_root(cfg) / "runs", run.path)
+    except (OSError, ValueError) as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        run.finish(status="failed", error=repr(e))
+        return 4
+    s = res["summary"]
+    print(f"{'condition':<18} {'admissions':>10} {'pairs':>6} {'follows':>8} {'stale':>6} {'dropped':>8} {'other':>6}"
+          "  faithfulness [95% CI]")
+    for c, d in s["conditions"].items():
+        print(f"{c:<18} {d['n_admissions']:>10} {d['n_pairs']:>6} {d['follows']:>8} {d['stale']:>6} "
+              f"{d['dropped']:>8} {d['other']:>6}  {fmt_ci(d['faithfulness'])}")
+    if "paired_difference" in s:
+        print(f"paired difference (enforced - plain): {fmt_ci(s['paired_difference'])}")
+    for c, d in s["terms"].items():
+        print(f"{c}: lab-derived term in original Impression/Recommendations {d['present_in_original']}, "
+              f"survives the edit into the normal range {d['survives_edit']}")
+    for c, d in s["null_targets"].items():
+        n_lines = sum(r["n_lines"] for r in s["null_churn"] if r["condition"] == c)
+        n_changed = sum(r["n_changed"] for r in s["null_churn"] if r["condition"] == c)
+        print(f"{c}: null-edit churn {n_changed}/{n_lines} lines changed over {d['n']} null-edit targets")
+    print(f"\nwrote audit_pairs.csv, audit_by_section.csv, audit_terms.csv, audit_null_churn.csv, audit_summary.md/json, "
+          f"audit_manual_check.csv ({res['n_manual']} pairs to check by hand) to {run.path}")
+    run.finish(audit_runs=args.audit_run, n_pairs=res["n_pairs"],
+               faithfulness={c: d["faithfulness"] for c, d in s["conditions"].items()})
+    return 0
+
+
 def cmd_run_pilot(args: argparse.Namespace) -> int:
     """Phase 6: regenerate with frozen evidence for every edit and control."""
     from ehr_rag.config import validate_for_generation
@@ -1063,6 +1101,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="confirm when new calls exceed generation.confirm_threshold")
     p.add_argument("--no-cache", action="store_true", help="bypass the response cache (fresh calls)")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name> (used by scripts/audit_array.sbatch)")
+    p = add("analyze-audit", cmd_analyze_audit,
+            "Counterfactual audit labels (Follows/Stale/Dropped/Other), faithfulness with bootstrap CIs, "
+            "term survival, null-edit churn, manual-check CSV.")
+    p.add_argument("--audit-run", required=True, nargs="+", help="run id(s) of `run-audit` runs (shards)")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("run-pilot", cmd_run_pilot,
             "Phase 6: frozen-evidence regenerations for every edit plus unperturbed controls.")
     p.add_argument("--targets-run", required=True, help="run id of a `select-targets` run")

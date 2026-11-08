@@ -299,3 +299,198 @@ def test_run_audit_refuses_changed_prompt(env: dict[str, Any], monkeypatch: pyte
     monkeypatch.setattr(backends, "make_backend", lambda g: FakeBackend(realistic_responder))
     assert main(["run-audit", "--config", str(env["root"] / "config" / "test.yaml"), "--targets-run", tdir.name]) == 4
     assert "differs from the original prompt.txt" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- task 4: labels
+
+
+def _ctx_and_edit(u: Any, group: str | None = None) -> tuple[Any, Any, Any]:
+    import dataclasses
+
+    from checker_fakes import checker
+
+    ck = checker()
+    r = _edit(u, group)
+    edited = dataclasses.replace(u, fields=r.edited_fields, text=r.edited_text)
+    return ck, ck.admission([u], [u]), edited
+
+
+@pytest.mark.parametrize("claim,label", [
+    ("Potassium peaked at 5.9", "stale"),            # an original value
+    ("Potassium was 4.2", "follows"),                # the edited value (midpoint)
+    ("Hyperkalemia was present", "stale"),           # lab-derived term holds only for the original
+    ("Potassium was normal", "other"),               # the original LAST value (4.3) was normal already
+    ("There was no hyperkalemia", "follows"),        # negated term
+    ("Potassium was elevated", "stale"),
+    ("Potassium was checked", "other"),              # cites, states neither
+    ("Potassium rose from 5.9 to 4.2", "other"),     # states both
+])
+def test_labels_for_a_flagged_unit_edited_to_normal(claim: str, label: str) -> None:
+    from ehr_rag.perturb.analyze import audit_label, audit_signals
+
+    k = audit_units()[0]                               # potassium 4.1 / 5.9 [HIGH] / 4.3 -> all 4.2
+    ck, ctx, edited = _ctx_and_edit(k)
+    assert audit_label(audit_signals(ck, ctx, claim, k, edited)) == label
+
+
+def test_normal_claim_follows_when_the_last_value_was_abnormal() -> None:
+    from ehr_rag.perturb.analyze import audit_label, audit_signals
+
+    na = audit_units()[1]                              # sodium 130 / 128, both [LOW] -> 139
+    ck, ctx, edited = _ctx_and_edit(na)
+    assert audit_label(audit_signals(ck, ctx, "Sodium was normal", na, edited)) == "follows"
+    assert audit_label(audit_signals(ck, ctx, "Hyponatremia to 128", na, edited)) == "stale"
+
+
+@pytest.mark.parametrize("claim,label", [
+    ("Chloride was elevated", "follows"),            # 101 / 103 -> all 114 [HIGH]
+    ("Chloride was 114", "follows"),
+    ("Chloride was normal at 101", "stale"),
+    ("Chloride 103", "stale"),
+])
+def test_labels_for_a_normal_unit_edited_out_of_range(claim: str, label: str) -> None:
+    from ehr_rag.perturb.analyze import audit_label, audit_signals
+
+    cl = audit_units()[2]
+    ck, ctx, edited = _ctx_and_edit(cl)
+    assert audit_label(audit_signals(ck, ctx, claim, cl, edited)) == label
+
+
+def test_dropped_and_best_match() -> None:
+    from ehr_rag.perturb.analyze import audit_label, best_match
+
+    assert audit_label(None) == "dropped"
+    orig = {"section": "Findings", "text": "Potassium peaked at 5.9"}
+    cands = [{"section": "Impression", "text": "Potassium peaked at 5.9", "line": "a"},
+             {"section": "Findings", "text": "Potassium was 4.2 on admission", "line": "b"},
+             {"section": "Findings", "text": "Potassium peaked at 4.2", "line": "c"}]
+    assert best_match(orig, cands)["line"] == "c"          # same section first, then the most similar
+    assert best_match(orig, []) is None
+
+
+def test_terms_and_churn_helpers() -> None:
+    from checker_fakes import checker
+    from ehr_rag.eval.parse import parse_report
+    from ehr_rag.perturb.analyze import _ir_terms, _term_names, section_churn
+
+    ck = checker()
+    k, na = audit_units()[0], audit_units()[1]
+    assert _term_names(ck, k, "high") == {"hyperkalemia"} and _term_names(ck, na, "low") == {"hyponatremia"}
+    ctx = ck.admission([k], [k])
+    rep = parse_report("### Impression\nHyperkalemia was treated. [E1]\n### Recommendations\nRecheck. [E1]\n")
+    assert _ir_terms(rep, ctx) == {"hyperkalemia"}
+    a = parse_report("### History\nA. [E1]\nB. [E1]\n### Findings\nC. [E1]\nInsufficient evidence. [NONE]\n")
+    b = parse_report("### History\nA. [E1]\nB changed. [E1]\n### Findings\nC. [E1]\n")
+    churn = {s: (n, c) for s, n, c in section_churn(a, b)}
+    assert churn["History"] == (2, 1) and churn["Findings"] == (1, 0) and churn["Impression"] == (0, 0)
+
+
+# --------------------------------------------------------------------------- task 5: statistics and outputs
+
+
+def test_bootstrap_is_deterministic_and_brackets_the_estimate() -> None:
+    from ehr_rag.stats import bootstrap, ratio_stat
+
+    groups = {h: (h % 3, 2) for h in range(30)}          # num, den per admission
+    stat = ratio_stat(lambda x: x[0], lambda x: x[1])
+    a, b = bootstrap(groups, stat, 1000, 13), bootstrap(groups, stat, 1000, 13)
+    assert a == b and a["n_resamples"] == 1000 and a["n_groups"] == 30
+    assert a["ci_low"] <= a["estimate"] <= a["ci_high"] and a["ci_low"] < a["ci_high"]
+    assert bootstrap({}, stat, 10, 1)["estimate"] is None
+    assert bootstrap({1: (0, 0)}, stat, 10, 1)["estimate"] is None        # zero denominator
+
+
+def _pair(cond: str, h: int, label: str, section: str = "Findings") -> dict[str, Any]:
+    return {"condition": cond, "hadm_id": h, "auto_label": label, "section": section, "pair_id": f"{cond}{h}{label}"}
+
+
+def test_summary_faithfulness_paired_and_manual_sample() -> None:
+    from ehr_rag.perturb.analyze import audit_manual_sample, summarize_audit
+
+    pairs = ([_pair("ehr_rag", h, "follows" if h % 2 else "stale") for h in range(20)]
+             + [_pair("ehr_rag", 3, "dropped"), _pair("ehr_rag", 5, "other", "Impression")]
+             + [_pair("ehr_rag_enforced", h, "follows") for h in range(20)])
+    churn = [{"condition": "ehr_rag", "section": "Findings", "n_lines": 4, "n_changed": 1, "target_id": "A1",
+              "null_unit_cited_after": False}]
+    s = summarize_audit({"pairs": pairs, "terms": [], "churn": churn}, 1000, 13)
+    p, e = s["conditions"]["ehr_rag"], s["conditions"]["ehr_rag_enforced"]
+    assert (p["n_pairs"], p["follows"], p["stale"], p["dropped"], p["other"]) == (22, 10, 10, 1, 1)
+    assert p["faithfulness"]["estimate"] == pytest.approx(0.5) and e["faithfulness"]["estimate"] == 1.0
+    d = s["paired_difference"]
+    assert d["estimate"] == pytest.approx(0.5) and d["n_groups"] == 20 and d["ci_low"] > 0
+    assert s["null_churn"] == [{"condition": "ehr_rag", "section": "Findings", "n_lines": 4, "n_changed": 1,
+                                "share_changed": 0.25}]
+    sample = audit_manual_sample(pairs, 50, 13)
+    assert len(sample) == 42 and sample == audit_manual_sample(pairs, 50, 13)   # capped by availability
+    few = audit_manual_sample(pairs, 5, 13)
+    assert {(x["condition"], x["auto_label"]) for x in few} == {
+        ("ehr_rag", "dropped"), ("ehr_rag", "follows"), ("ehr_rag", "other"), ("ehr_rag", "stale"),
+        ("ehr_rag_enforced", "follows")}                                         # one per stratum first
+
+
+# --------------------------------------------------------------------------- end to end with fake "models"
+
+
+def _responder(kind: str, edits: list[dict[str, Any]]) -> Any:
+    """FAKE models for edited prompts: 'follow' restates the edited unit; 'ignore' restates the original
+    values (stale); 'drop' leaves the lab out. Rewrites copy the cited unit's max value back."""
+    import re
+
+    from fakes import realistic_report
+
+    def respond(prompt: str, n: int) -> str:
+        if prompt.startswith("One sentence of a clinical report failed"):
+            m = re.search(r"^\[(E\d+)\] \(lab\) (.*?)(?:,|\s\()", prompt, re.MULTILINE)
+            v = re.search(r"(?:max|Value) (-?\d+(?:\.\d+)?)", prompt)
+            return f"{m.group(2)} reached {v.group(1)}. [{m.group(1)}]" if m and v else "Insufficient evidence. [NONE]"
+        edit = next((e for e in edits if e["edited_text"] in prompt), None)
+        if edit is None or kind == "follow":
+            return realistic_report(prompt)
+        if kind == "ignore":
+            return realistic_report(prompt.replace(edit["edited_text"], edit["original_text"]))
+        rep = realistic_report(prompt)
+        return re.sub(r"### Findings\n(?:.*\n)*?(?=### )", "### Findings\nInsufficient evidence. [NONE]\n", rep)
+    return respond
+
+
+@pytest.mark.parametrize("kind,plain,enforced", [
+    ("follow", "follows", "follows"),
+    ("ignore", "stale", "follows"),      # enforcement rewrites the stale value from the edited unit
+    ("drop", "dropped", "dropped"),
+])
+def test_audit_end_to_end(env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+                          kind: str, plain: str, enforced: str) -> None:
+    import csv as csv_mod
+    import json
+
+    import ehr_rag.generation.backends as backends
+    from ehr_rag.cli import main
+    from fakes import FakeBackend, realistic_responder
+
+    gen = _base_run(env, realistic_responder)
+    tdir = _targets(env, gen)
+    edits = [json.loads(x) for x in (tdir / "audit_edits.jsonl").read_text(encoding="utf-8").splitlines()]
+    monkeypatch.setattr(backends, "make_backend", lambda g: FakeBackend(_responder(kind, edits)))
+    cfg = str(env["root"] / "config" / "test.yaml")
+    assert main(["run-audit", "--config", cfg, "--targets-run", tdir.name, "--yes",
+                 "--run-id", "20990101-000001-run-audit"]) == 0
+    capsys.readouterr()
+    assert main(["analyze-audit", "--config", cfg, "--audit-run", "20990101-000001-run-audit",
+                 "--run-id", "20990101-000002-analyze-audit"]) == 0
+    out = capsys.readouterr().out
+    assert "faithfulness [95% CI]" in out and "Fakeium" not in out
+    run = env["root"] / "runs" / "20990101-000002-analyze-audit"
+    with (run / "audit_pairs.csv").open(encoding="utf-8") as f:
+        pairs = list(csv_mod.DictReader(f))
+    labels = {(p["condition"], p["auto_label"]) for p in pairs}
+    assert labels == {("ehr_rag", plain), ("ehr_rag_enforced", enforced)}
+    assert all(p["original_states_value_or_direction"] == "True" for p in pairs if p["condition"] == "ehr_rag")
+    summary = json.loads((run / "audit_summary.json").read_text(encoding="utf-8"))
+    faith = summary["conditions"]["ehr_rag"]["faithfulness"]["estimate"]
+    assert faith == {"follows": 1.0, "stale": 0.0, "dropped": None}[plain]
+    for f in ("audit_by_section.csv", "audit_terms.csv", "audit_null_churn.csv", "audit_summary.md",
+              "audit_manual_check.csv"):
+        assert (run / f).exists(), f
+    with (run / "audit_manual_check.csv").open(encoding="utf-8") as f:
+        manual = list(csv_mod.DictReader(f))
+    assert manual and all(r["human_label"] == "" for r in manual) and manual[0]["edited_unit_text"]
