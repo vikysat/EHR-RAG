@@ -1,0 +1,83 @@
+# Full MIMIC-IV cohort (cluster). Identical to default.yaml except `data`:
+# build-units reads the Parquet written by extract-cohort (cohort.out_dir/evidence),
+# and all derived files go to a separate gitignored directory.
+# On the cluster: ln -s <MIMIC-IV root> data/mimiciv ; ln -s <MIMIC-IV-Note root> data/mimic-iv-note
+data:
+  source: full                 # credentialed: commands print counts only; external backends refused
+  root: data/cohort/evidence   # = cohort.out_dir/evidence (extract-cohort output)
+  derived: data/derived_full
+
+selection:
+  min_distinct_labs: 10
+  min_abnormal_labs: 3
+  min_distinct_drugs: 5
+  min_diagnoses: 3
+  n_admissions: 15
+
+cohort:                        # select-cohort / extract-cohort (full MIMIC-IV, DuckDB)
+  mimic_root: data/mimiciv     # full MIMIC-IV (hosp/*.csv.gz); symlink on the cluster
+  note_root: data/mimic-iv-note   # MIMIC-IV-Note (note/discharge.csv.gz); symlink on the cluster
+  demo_root: data/mimic-iv-clinical-database-demo-2.2   # subject ids to exclude; reference columns
+  out_dir: data/cohort         # gitignored: id lists, extracted Parquet, reference notes
+  pool_fraction: 0.1           # seeded share of all subject_ids
+  seed: 13
+  min_los_days: 2              # hospital stay, inclusive bounds
+  max_los_days: 14
+  min_prior_admissions: 1
+  min_lab_results: 20          # labevents rows with this hadm_id
+  n_dev: 20
+  n_test: 100
+
+units:
+  max_prior_admissions: 3
+  max_history_dx_per_admission: 5
+
+retrieval:
+  dense_query_model: ncbi/MedCPT-Query-Encoder
+  dense_doc_model: ncbi/MedCPT-Article-Encoder
+  rrf_k: 60
+  top_k_per_query: 5
+  max_units_per_section: 10
+  max_units_total: 30
+  rerank: false
+  rerank_model: ncbi/MedCPT-Cross-Encoder
+  relevance_export_pairs: 10
+  queries:
+    History:
+      - "past medical history and prior diagnoses"
+      - "chronic conditions related to {primary_dx}"
+    Findings:
+      - "laboratory results high low"
+      - "blood test values {primary_dx}"
+      - "procedures performed during admission"
+    Impression:
+      - "primary diagnosis {primary_dx}"
+      - "secondary diagnoses and complications"
+    Recommendations:
+      - "medications drugs dose route administered"
+      - "treatment for {primary_dx}"
+
+generation:
+  backend: hf_local             # anthropic | openai_compatible | hf_local  (REQUIRED)
+  model: meta-llama/Llama-3.1-8B-Instruct   # REQUIRED
+  base_url: null
+  api_key_env: null            # API backends only: env var holding the key
+  temperature: 0.0
+  max_tokens: 1500             # hf_local: max_new_tokens
+  prompt_version: report_v1
+  conditions: [no_retrieval, ehr_rag, full_context]
+  max_context_tokens: 32000     # full_context: whole templated prompt, model tokenizer
+  confirm_threshold: 20
+  endpoint_is_physionet_compliant: false
+
+eval:
+  nli_model: cross-encoder/nli-deberta-v3-base   # verify it loads; read id2label
+  manual_review_n: 100
+  seed: 13
+
+perturbation:
+  n_targets: 15
+  max_targets_per_admission: 2
+  edit_types: [lab_minor, lab_major, med_dose, delete]
+  n_controls: 3
+  seed: 13

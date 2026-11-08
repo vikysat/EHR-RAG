@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ehr_rag.config import SECTIONS, project_root, resolve_path
-from ehr_rag.evidence.build_units import read_header, units_dir
+from ehr_rag.evidence.build_units import check_evidence_sources, read_header, units_dir
 from ehr_rag.evidence.schema import EvidenceUnit, read_units
 from ehr_rag.generation.backends import Backend, Completion
 from ehr_rag.generation.prompt import PromptTemplates, build_prompt, load_templates, with_format_reminder
@@ -354,6 +354,8 @@ def run_generation(
     templates = load_templates(root / "prompts", gen["prompt_version"])
     udir = units_dir(resolve_path(cfg, cfg["data"]["derived"]))
     units_by_h = {h: read_units(udir / f"{h}.jsonl") for h in hadm_ids}
+    for units in units_by_h.values():
+        check_evidence_sources(units)
     headers = {h: read_header(udir, h) for h in hadm_ids}
     retrieval = None
     if "ehr_rag" in conditions:

@@ -26,6 +26,14 @@ def cmd_validate_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _quiet(cfg: dict) -> bool:
+    """With credentialed data (``data.source: full``) commands print counts only, never rows or text."""
+    return cfg["data"]["source"] == "full"
+
+
+QUIET_NOTE = "(data.source is 'full': rows and text are not printed{})"
+
+
 def _print_table(df: "pd.DataFrame") -> None:
     import pandas as pd
     from pathlib import Path
@@ -209,10 +217,20 @@ def cmd_cohort_schema_check(args: argparse.Namespace) -> int:
     return 0 if ok else 3
 
 
-def _selected_ids(cfg: dict) -> list[int]:
+def _selected_ids(cfg: dict, args: argparse.Namespace | None = None) -> list[int]:
+    """Target admissions: ``--hadm-ids``, else ``--split`` (hash-checked cohort lists), else
+    ``config/selected_admissions.yaml``."""
     from ehr_rag.config import project_root
     from ehr_rag.data.select_admissions import load_selected_hadm_ids
 
+    hadm_ids = getattr(args, "hadm_ids", None)
+    split = getattr(args, "split", None)
+    if hadm_ids and split:
+        raise ConfigError("give either --hadm-ids or --split, not both")
+    if hadm_ids:
+        return [int(h) for h in hadm_ids]
+    if split:
+        return _split_ids(cfg, split)
     return load_selected_hadm_ids(project_root(cfg) / "config" / "selected_admissions.yaml")
 
 
@@ -239,7 +257,7 @@ def cmd_build_units(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     seed = cfg["eval"]["seed"]
     run = start_run(cfg, "build-units", command="build-units", seed=seed)
-    ids = _selected_ids(cfg)
+    ids = _selected_ids(cfg, args)
     out = _units_dir(cfg)
     counts, dropped = build_all(load_tables(cfg), ids, cfg["units"], out)
     counts.to_csv(out / "unit_counts.csv", index=False)
@@ -251,17 +269,20 @@ def cmd_build_units(args: argparse.Namespace) -> int:
     print("== Unit counts by type per admission")
     _print_table(pd.concat([counts, pd.DataFrame([{"hadm_id": "TOTAL", **counts.drop(columns="hadm_id").sum()}])]))
 
-    print(f"\n== Example units (3 per type, different admissions, seed {seed})")
-    rng = random.Random(seed)
-    all_units = {h: read_units(out / f"{h}.jsonl") for h in ids}
-    for t in UNIT_TYPES:
-        having = [h for h in ids if any(u.unit_type == t for u in all_units[h])]
-        for h in sorted(rng.sample(having, min(3, len(having)))):
-            u = rng.choice([u for u in all_units[h] if u.unit_type == t])
-            print(f"\n--- {t} (hadm {h})")
-            print(u.to_json())
-    print(f"\n== Example header (hadm {ids[0]})")
-    print(json.dumps(json.loads((out / f"{ids[0]}_header.json").read_text(encoding="utf-8")), indent=2))
+    if _quiet(cfg):
+        print("\n" + QUIET_NOTE.format(f"; units and headers are in {out}"))
+    else:
+        print(f"\n== Example units (3 per type, different admissions, seed {seed})")
+        rng = random.Random(seed)
+        all_units = {h: read_units(out / f"{h}.jsonl") for h in ids}
+        for t in UNIT_TYPES:
+            having = [h for h in ids if any(u.unit_type == t for u in all_units[h])]
+            for h in sorted(rng.sample(having, min(3, len(having)))):
+                u = rng.choice([u for u in all_units[h] if u.unit_type == t])
+                print(f"\n--- {t} (hadm {h})")
+                print(u.to_json())
+        print(f"\n== Example header (hadm {ids[0]})")
+        print(json.dumps(json.loads((out / f"{ids[0]}_header.json").read_text(encoding="utf-8")), indent=2))
 
     print("\n== Dropped / lossy handling (summed over selected admissions)")
     if len(dropped_df):
@@ -296,7 +317,7 @@ def cmd_retrieve(args: argparse.Namespace) -> int:
 
     cfg = load_config(args.config)
     run = start_run(cfg, "retrieve", command="retrieve")
-    ids = [int(h) for h in args.hadm_ids] if args.hadm_ids else _selected_ids(cfg)
+    ids = _selected_ids(cfg, args)
     units = _load_all_units(cfg, ids)
     enc = _encoders(cfg)
     results = {}
@@ -304,7 +325,11 @@ def cmd_retrieve(args: argparse.Namespace) -> int:
         res = retrieve_admission(units[h], enc, cfg["retrieval"])
         run.write_json(f"retrieval/{h}.json", evidence_record(res, units[h]))
         results[h] = res
-    for h in ids[: args.show]:
+    show = args.show
+    if _quiet(cfg) and show:
+        print(QUIET_NOTE.format(f"; retrieval results are in {run.path / 'retrieval'}"))
+        show = 0
+    for h in ids[:show]:
         res = results[h]
         by_id = {u.unit_id: u for u in units[h]}
         print(f"\n{'=' * 100}\nhadm_id {h}  |  primary_dx: {res.primary_dx}  |  "
@@ -338,7 +363,7 @@ def cmd_export_relevance(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     seed = cfg["eval"]["seed"]
     run = start_run(cfg, "export-relevance", command="export-relevance", seed=seed)
-    ids = _selected_ids(cfg)
+    ids = _selected_ids(cfg, args)
     units = _load_all_units(cfg, ids)
     all_pairs = []
     for h in ids:
@@ -399,7 +424,7 @@ def cmd_retrieval_metrics(args: argparse.Namespace) -> int:
 
 
 def _target_ids(cfg: dict, args: argparse.Namespace) -> list[int]:
-    ids = [int(h) for h in args.hadm_ids] if args.hadm_ids else _selected_ids(cfg)
+    ids = _selected_ids(cfg, args)
     if args.limit is not None:
         ids = ids[: args.limit]
     if not ids:
@@ -521,8 +546,14 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             vals = " ".join(f"{'n/a' if r[m] is None else format(r[m], '.3f'):>22}" for m in METRICS)
             print(f"{r['condition']:<13} {r['scope']:<27} {r['n_sentences']:>5} {r['n_abstentions']:>5} {vals}")
     print(f"\nformat status: {res['format_counts']}")
-    print(f"\n== 10 random sentences (seed {seed}) for checking the harness by hand")
-    for i, x in enumerate(gate_sample(res["sentences"], res["texts"], 10, seed), 1):
+    sample = gate_sample(res["sentences"], res["texts"], 10, seed)
+    run.write_json("gate_sample.json", sample)
+    if _quiet(cfg):
+        print("\n" + QUIET_NOTE.format("; the 10-sentence check is in gate_sample.json"))
+        sample = []
+    else:
+        print(f"\n== 10 random sentences (seed {seed}) for checking the harness by hand")
+    for i, x in enumerate(sample, 1):
         print(f"\n[{i}] {x['condition']} hadm {x['hadm_id']} {x['section']}")
         print(f"  sentence : {x['sentence']}")
         print(f"  cited    : {x['cited_ids']}  invalid: {x['invalid_ids']}  irrelevant: {x['irrelevant_ids']}")
@@ -606,11 +637,13 @@ def cmd_select_targets(args: argparse.Namespace) -> int:
     print(f"candidates: {len(res['candidates'])} ({n_elig} eligible); targets: {len(res['targets'])} "
           f"(n_targets {cfg['perturbation']['n_targets']}, max per admission "
           f"{cfg['perturbation']['max_targets_per_admission']}, seed {cfg['perturbation']['seed']})")
-    if res["targets"]:
+    if _quiet(cfg):
+        print(QUIET_NOTE.format(f"; targets and edits are in {run.path}"))
+    elif res["targets"]:
         _print_table(pd.DataFrame([{k: t.to_dict()[k] for k in ("target_id", "hadm_id", "unit_id", "unit_type",
                                     "label", "value", "fields_matched", "sentence")} for t in res["targets"]]))
     print(f"\nedits applied: {len(res['edits'])}; skipped: {len(res['skipped'])}")
-    for e in res["edits"]:
+    for e in ([] if _quiet(cfg) else res["edits"]):
         print(f"\n{e['target_id']} {e['edit_type']}: {e['original_value']} -> {e['edited_value']}")
         print(f"  before: {e['original_text']}")
         print(f"  after : {e['edited_text'] or '<unit removed from evidence>'}")
@@ -672,9 +705,12 @@ def cmd_analyze_perturbation(args: argparse.Namespace) -> int:
     run = start_run(cfg, "analyze-perturbation", command="analyze-perturbation")
     res = analyze(pdir, project_root(cfg) / "runs", run.path)
     print(summary_markdown(res["summary"], pdir.name))
-    print("== Worked examples (up to 3 per edit type)")
+    if _quiet(cfg):
+        print(QUIET_NOTE.format("; worked examples are in perturbation_manual_check.csv"))
+    else:
+        print("== Worked examples (up to 3 per edit type)")
     shown: dict[str, int] = {}
-    for r in res["rows"]:
+    for r in ([] if _quiet(cfg) else res["rows"]):
         if r["kind"] != "edit" or shown.get(r["edit_type"], 0) >= 3:
             continue
         shown[r["edit_type"]] = shown.get(r["edit_type"], 0) + 1
@@ -726,13 +762,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("cohort-schema-check", cmd_cohort_schema_check,
             "Column differences between full MIMIC-IV, the Demo and the extracted Parquet (headers only).")
     p.add_argument("--skip-notes", action="store_true", help="do not check the MIMIC-IV-Note discharge table")
-    add("build-units", cmd_build_units,
-        "Phase 2: build evidence units and headers for admissions in config/selected_admissions.yaml.")
+    p = add("build-units", cmd_build_units,
+            "Phase 2: build evidence units and headers for admissions in config/selected_admissions.yaml "
+            "(or --split).")
+    p.add_argument("--split", nargs="+", choices=["dev", "test"],
+                   help="cohort split(s) from select-cohort (hash-checked) instead of selected_admissions.yaml")
     p = add("retrieve", cmd_retrieve, "Phase 3: per-section hybrid retrieval for the selected admissions.")
     p.add_argument("--hadm-ids", nargs="*", help="restrict to these admissions (default: all selected)")
     p.add_argument("--show", type=int, default=2, help="print sections for the first N admissions (default 2)")
-    add("export-relevance", cmd_export_relevance,
-        "Phase 3: write relevance_to_label.csv (pooled top-10 of BM25/dense/fused) for manual labeling.")
+    p.add_argument("--split", nargs="+", choices=["dev", "test"],
+                   help="cohort split(s) from select-cohort (hash-checked) instead of selected_admissions.yaml")
+    p = add("export-relevance", cmd_export_relevance,
+            "Phase 3: write relevance_to_label.csv (pooled top-10 of BM25/dense/fused) for manual labeling.")
+    p.add_argument("--split", nargs="+", choices=["dev", "test"],
+                   help="cohort split(s) from select-cohort (hash-checked) instead of selected_admissions.yaml")
     p = add("retrieval-metrics", cmd_retrieval_metrics,
             "Phase 3: Recall@5 and MRR per method from a labeled relevance CSV (pooled relevance).")
     p.add_argument("--labels", required=True, help="labeled relevance_to_label.csv")
@@ -741,6 +784,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--conditions", nargs="+", help="subset of generation.conditions (default: all configured)")
     p.add_argument("--limit", type=int, help="only the first N selected admissions")
     p.add_argument("--hadm-ids", nargs="*", help="restrict to these admissions (default: all selected)")
+    p.add_argument("--split", nargs="+", choices=["dev", "test"],
+                   help="cohort split(s) from select-cohort (hash-checked) instead of selected_admissions.yaml")
     p.add_argument("--retrieval-run", help="run id of a saved `retrieve` run (required for ehr_rag)")
     p.add_argument("--yes", action="store_true", help="confirm when new calls exceed generation.confirm_threshold")
     p.add_argument("--no-cache", action="store_true", help="bypass the response cache (fresh calls)")
@@ -774,6 +819,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Phase 4: print full_context templated-prompt tokens per admission vs max_context_tokens.")
     p.add_argument("--limit", type=int, help="only the first N selected admissions")
     p.add_argument("--hadm-ids", nargs="*", help="restrict to these admissions (default: all selected)")
+    p.add_argument("--split", nargs="+", choices=["dev", "test"],
+                   help="cohort split(s) from select-cohort (hash-checked) instead of selected_admissions.yaml")
     return parser
 
 

@@ -295,3 +295,72 @@ def test_extract_and_schema_cli(tmp_path: Path, fake_mimic: tuple[Path, Path, Pa
     assert "new_full_only_column" in out and "same as the Demo" in out and "OK:" in out
     ids_path(cfg, "dev").write_text("1\n", encoding="ascii")          # tampered list: refused
     assert main(["extract-cohort", "--config", str(cfg_path), "--splits", "dev"]) == 2
+
+
+# --------------------------------------------------------------------------- builder on the extracted Parquet
+
+
+def test_full_config_matches_default_except_data() -> None:
+    full = load_config(REPO / "config" / "full.yaml")
+    default = load_config(REPO / "config" / "default.yaml")
+    assert {k: v for k, v in full.items() if k != "data"} == {k: v for k, v in default.items() if k != "data"}
+    assert full["data"]["source"] == "full" and full["data"]["derived"] != default["data"]["derived"]
+    assert Path(full["data"]["root"]) == Path(full["cohort"]["out_dir"]) / "evidence"
+
+
+def test_build_units_from_split_on_parquet_quietly(tmp_path: Path, fake_mimic: tuple[Path, Path, Path],
+                                                   capsys: pytest.CaptureFixture) -> None:
+    from ehr_rag.cli import main
+    from ehr_rag.data.cohort import evidence_root
+    from ehr_rag.evidence.schema import read_units
+
+    cfg_path = _cohort_config(tmp_path, *fake_mimic)
+    assert main(["select-cohort", "--config", str(cfg_path)]) == 0
+    assert main(["extract-cohort", "--config", str(cfg_path)]) == 0
+    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    raw["data"].update(source="full", root=str(evidence_root(load_config(cfg_path))),
+                       derived=str(tmp_path / "derived_full"))
+    cfg_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    capsys.readouterr()
+    assert main(["build-units", "--config", str(cfg_path), "--split", "dev"]) == 0
+    out = capsys.readouterr().out
+    dev = load_split_ids(load_config(cfg_path), "dev")
+    units = {h: read_units(tmp_path / "derived_full" / "units" / f"{h}.jsonl") for h in dev}
+    assert all(units.values())
+    assert "rows and text are not printed" in out
+    assert not any(u.text in out for us in units.values() for u in us)
+    import argparse
+
+    from ehr_rag.cli import _selected_ids
+
+    with pytest.raises(ConfigError, match="not both"):
+        _selected_ids(load_config(cfg_path), argparse.Namespace(split=["dev"], hadm_ids=["1"]))
+    assert _selected_ids(load_config(cfg_path), argparse.Namespace(split=["dev", "test"], hadm_ids=None)) ==         dev + load_split_ids(load_config(cfg_path), "test")
+
+
+def test_notes_under_evidence_root_are_refused(fake_config: Path) -> None:
+    from ehr_rag.config import load_config as load
+    from ehr_rag.data.load import SchemaError, load_tables
+
+    cfg = load(fake_config)
+    root = Path(cfg["data"]["root"])
+    (root / "reference").mkdir()
+    (root / "reference" / "discharge.parquet").write_bytes(b"FAKE")
+    with pytest.raises(SchemaError, match="never enter the evidence"):
+        load_tables(cfg)
+    (root / "reference" / "discharge.parquet").unlink()
+    (root / "note").mkdir()
+    with pytest.raises(SchemaError, match="clinical notes"):
+        load_tables(cfg)
+
+
+def test_units_from_note_tables_are_refused(fake_config: Path) -> None:
+    from ehr_rag.data.load import load_tables
+    from ehr_rag.evidence.build_units import build_units_for_admission, check_evidence_sources
+
+    cfg = load_config(fake_config)
+    units, _ = build_units_for_admission(load_tables(cfg), 12, cfg["units"])
+    check_evidence_sources(units)
+    units[0].source_table = "discharge"
+    with pytest.raises(ValueError, match="never evidence"):
+        check_evidence_sources(units)

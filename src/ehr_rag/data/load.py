@@ -242,11 +242,30 @@ def link_labs(labs: pd.DataFrame, admissions: pd.DataFrame) -> tuple[pd.DataFram
     return linked, stats
 
 
+# MIMIC-IV-Note tables. The current admission's discharge summary is the evaluation
+# reference, so no note may ever sit under the evidence data root.
+NOTE_TABLE_NAMES: tuple[str, ...] = ("discharge", "discharge_detail", "radiology", "radiology_detail")
+
+
+def check_no_notes(root: Path) -> None:
+    """Raise SchemaError if any clinical-note table (or a ``note/`` module) is under ``root``."""
+    hits = [p for p in root.rglob("*")
+            if (p.is_dir() and p.name == "note")
+            or (p.is_file() and p.name.split(".")[0] in NOTE_TABLE_NAMES)]
+    if hits:
+        raise SchemaError(
+            f"clinical notes found under the evidence data root {root}: {sorted(str(h) for h in hits)[:5]}. "
+            "Discharge summaries are evaluation references only and must never enter the evidence."
+        )
+
+
 def load_tables(cfg: dict[str, Any]) -> Tables:
     """Locate, check and load all tables; link labs to admissions.
 
-    Raises SchemaError on any missing file or missing expected column.
+    Raises SchemaError on any missing file or missing expected column, and if any
+    clinical-note table is under the data root (``check_no_notes``).
     """
+    check_no_notes(data_root(cfg))
     files = find_table_files(data_root(cfg))
     report = check_columns(files)
     missing = {t: r["missing"] for t, r in report.items() if r["missing"]}

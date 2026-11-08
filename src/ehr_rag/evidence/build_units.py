@@ -327,6 +327,18 @@ def build_units_for_admission(
     return units, drop
 
 
+# The only tables a unit may come from. Clinical notes (in particular the current
+# admission's discharge summary, the evaluation reference) are never evidence.
+EVIDENCE_SOURCE_TABLES: tuple[str, ...] = ("diagnoses_icd", "procedures_icd", "labevents", "prescriptions")
+
+
+def check_evidence_sources(units: list[EvidenceUnit]) -> None:
+    """Raise ValueError if any unit comes from a table outside ``EVIDENCE_SOURCE_TABLES``."""
+    bad = sorted({(u.unit_id, u.source_table) for u in units if u.source_table not in EVIDENCE_SOURCE_TABLES})
+    if bad:
+        raise ValueError(f"units from non-evidence tables {bad}; notes and discharge summaries are never evidence")
+
+
 def units_dir(derived: Path) -> Path:
     """Directory holding per-admission unit files."""
     return derived / "units"
@@ -341,6 +353,7 @@ def build_all(
     dropped: list[dict[str, Any]] = []
     for h in hadm_ids:
         units, drop = build_units_for_admission(tables, h, units_cfg)
+        check_evidence_sources(units)
         header = build_header(tables, h)
         write_units(out_dir / f"{h}.jsonl", units)
         (out_dir / f"{h}_header.json").write_text(

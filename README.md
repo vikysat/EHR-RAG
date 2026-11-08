@@ -107,6 +107,22 @@ scripts also save `nvidia-smi.txt`, `stdout.log` and `stderr.log` in the run fol
 Outputs that failed the format check get one retry with a format reminder; if the
 retry also fails, the report is marked `format_error` and the raw output is kept.
 
+### Full MIMIC-IV (`config/full.yaml`)
+
+`config/full.yaml` is `default.yaml` with a different `data` block: `data.source: full`,
+`data.root: data/cohort/evidence` (the Parquet from `extract-cohort`) and
+`data.derived: data/derived_full`. The builder code is unchanged. `build-units`,
+`retrieve`, `export-relevance`, `generate` and `context-tokens` take `--split dev|test`,
+which reads the cohort id list and checks it against `config/cohort/<split>_hadm_ids.sha256`.
+With `data.source: full`, commands print counts only; examples (units, retrieval
+sections, the 10-sentence check, perturbation examples) stay in the run folder.
+
+The current admission's discharge summary never enters the evidence: `load_tables`
+refuses a data root that contains any note table (`discharge*`, `radiology*`, or a
+`note/` directory), and `build-units` and `generate` refuse units whose
+`source_table` is not one of diagnoses_icd, procedures_icd, labevents, prescriptions.
+Discharge notes are extracted only to `<cohort.out_dir>/reference/`, for `text-metrics`.
+
 ## Configuration (`config/default.yaml`)
 
 Unknown or missing keys are errors.

@@ -154,3 +154,11 @@ better than it is, never guesses, and keeps the raw data for manual review.
 - **Reference notes:** only the target admissions' discharge notes are extracted, to
   `reference/`, never to the evidence root. Several notes of one admission are joined
   by a blank line in `note_seq` order in `references.csv`.
+- **Admission ids for full runs** come from `--split` (hash-checked), so
+  `config/selected_admissions.yaml` (the Demo's approved list) stays untouched.
+- **Reference-leak guard** is enforced twice: no note table may be under `data.root`
+  (`load_tables`), and every unit must come from a structured table (`build-units`,
+  and again in `generate` for unit files read from disk).
+- **Counts only on full data:** with `data.source: full`, every command that used to
+  print units, retrieved sections or report sentences writes them to its run folder
+  instead (`evaluate` writes `gate_sample.json`). Ids and counts are still printed.
