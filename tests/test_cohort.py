@@ -194,6 +194,24 @@ def test_split_hash_roundtrip_and_tamper(tmp_path: Path, fake_mimic: tuple[Path,
         load_split_ids(cfg, "test")
 
 
+def test_committed_cohort_hashes_are_in_write_split_format(tmp_path: Path,
+                                                           fake_mimic: tuple[Path, Path, Path]) -> None:
+    """The frozen cohort's hashes in config/cohort/ are byte for byte what ``write_split`` writes."""
+    import re
+
+    from ehr_rag.data.cohort import SPLITS
+
+    cfg = load_config(_cohort_config(tmp_path, *fake_mimic))
+    for split in SPLITS:
+        committed = (REPO / "config" / "cohort" / f"{split}_hadm_ids.sha256").read_bytes()
+        write_split(cfg, split, [10, 20, 30])
+        written = hash_path(cfg, split).read_bytes()
+        assert re.fullmatch(rb"[0-9a-f]{64}", committed[:64]), split
+        assert committed[64:] == written[64:], split        # same separator, file name and line ending
+    assert sorted(p.name for p in (REPO / "config" / "cohort").iterdir()) == [
+        "dev_hadm_ids.sha256", "test_hadm_ids.sha256"]       # hashes only, never the id lists
+
+
 def test_select_cohort_cli(tmp_path: Path, fake_mimic: tuple[Path, Path, Path],
                            capsys: pytest.CaptureFixture) -> None:
     from ehr_rag.cli import main
