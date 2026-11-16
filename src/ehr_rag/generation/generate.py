@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from ehr_rag import anonymize
 from ehr_rag.config import ENFORCED_CONDITIONS, SECTIONS, base_condition, project_root, resolve_path
 from ehr_rag.evidence.build_units import check_evidence_sources, read_header, units_dir
 from ehr_rag.evidence.schema import EvidenceUnit, read_units
@@ -395,7 +396,7 @@ def run_generation(
         cj = [j for j in jobs if j.condition == cond]
         log(f"  {cond}: {len(cj)} calls, estimated input tokens {sum(j.input_tokens for j in cj):,}")
     for s in skipped:
-        log(f"  SKIP full_context hadm {s['hadm_id']}: {s['input_tokens']:,} tokens > max_context_tokens "
+        log(f"  SKIP full_context {anonymize.admission(s['hadm_id'])}: {s['input_tokens']:,} tokens > max_context_tokens "
             f"{s['max_context_tokens']:,}")
     log(f"  total: {len(jobs)} calls ({n_cached} cached, {n_new} new); estimated input tokens "
         f"{sum(j.input_tokens for j in jobs):,} ({'exact, model tokenizer' if exact else 'approximate, chars/4'}); "
@@ -414,7 +415,7 @@ def run_generation(
         out_dir = run.path / job.condition / str(job.hadm_id)
         status = g.run_job(job, templates, out_dir, retrieval_run)
         counts[job.condition][status] += 1
-        msg = f"  [{i}/{len(jobs)}] {job.condition} hadm {job.hadm_id}: {status}"
+        msg = f"  [{i}/{len(jobs)}] {job.condition} {anonymize.admission(job.hadm_id)}: {status}"
         if job.condition in enforced:
             from ehr_rag.checker.enforce import add_summaries, enforce_dir
 

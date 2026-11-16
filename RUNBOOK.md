@@ -264,6 +264,15 @@ All commands use `--config config/full.yaml`. With `data.source: full` every com
 prints counts only; ids lists, Parquet, units, notes and run outputs stay under the
 gitignored `data/`, `cache/` and `runs/`. Generation stays local (`hf_local`).
 
+stdout, stderr and `stdout.log` / `stderr.log` never contain a `hadm_id` or
+`subject_id`: an admission is printed as `adm_001` ... `adm_120` (dev = `adm_001` to
+`adm_020`, test = `adm_021` to `adm_120`, each in the sorted order of its id list), the
+same number in every command and shard. To find the admission behind a number, look in
+the run folder (never copy this file out of `runs/`):
+```bash
+grep adm_042 runs/<run id>/admission_aliases.csv        # alias,hadm_id,subject_id
+```
+
 ### 10.0 Setup and download check (login node, internet available)
 
 ```bash
@@ -340,8 +349,8 @@ columns DIFFERENT` is exit 3: stop and report. (This also works before 10.2.)
 ```bash
 python -m ehr_rag.cli build-units --config config/full.yaml --split dev test
 ```
-Check the unit-count table (120 admissions) and the dropped summary. Units go to
-`data/derived_full/units/`.
+Check the unit-count table (120 rows, `adm_001` to `adm_120`) and the dropped summary.
+Units go to `data/derived_full/units/`.
 
 ### 10.5 Retrieval on dev (CPU) → RETRIEVE_DEV
 

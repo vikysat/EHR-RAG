@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 import yaml
 
+from ehr_rag import anonymize
 from ehr_rag.config import ConfigError, load_config, public_config
 
 DEFAULT_CONFIG = "config/default.yaml"
@@ -33,11 +34,27 @@ def cmd_validate_config(args: argparse.Namespace) -> int:
 
 
 def _quiet(cfg: dict) -> bool:
-    """With credentialed data (``data.source: full``) commands print counts only, never rows or text."""
+    """With credentialed data (``data.source: full``) commands print counts only, never rows or text,
+    and never a hadm_id or subject_id: admissions are shown as ``adm_001``... (``ehr_rag/anonymize.py``)."""
     return cfg["data"]["source"] == "full"
 
 
 QUIET_NOTE = "(data.source is 'full': rows and text are not printed{})"
+
+
+def _aliases(config: str) -> "anonymize.Aliases":
+    """Admission labels for the command about to run (anonymised only with ``data.source: full``)."""
+    try:
+        return anonymize.Aliases.for_config(load_config(config))
+    except (ConfigError, OSError, yaml.YAMLError):
+        return anonymize.Aliases()    # the command reports the config problem itself
+
+
+def _admission_column(df: "pd.DataFrame") -> "pd.DataFrame":
+    """For printing: with credentialed data the ``hadm_id`` column becomes the anonymised ``admission``."""
+    if not anonymize.active().enabled:
+        return df
+    return df.assign(hadm_id=[anonymize.label(h) for h in df["hadm_id"]]).rename(columns={"hadm_id": "admission"})
 
 
 def _print_table(df: "pd.DataFrame") -> None:
@@ -72,7 +89,9 @@ def cmd_inspect_data(args: argparse.Namespace) -> int:
         status = "OK" if not r["missing"] else f"MISSING {r['missing']}"
         mismatch |= bool(r["missing"])
         print(f"  {t}: {status}; extra columns not used: {r['extra']}")
-    for t, p in files.items():
+    if _quiet(cfg):
+        print("\n" + QUIET_NOTE.format("; the first rows of each table are not shown"))
+    for t, p in ([] if _quiet(cfg) else files.items()):
         print(f"\n== {t}: first 5 rows (expected columns only)")
         _print_table(head_rows(p)[[c for c in EXPECTED_COLUMNS[t] if c not in report[t]["missing"]]])
     if mismatch:
@@ -114,7 +133,10 @@ def cmd_select_admissions(args: argparse.Namespace) -> int:
     import pandas as pd
     from pathlib import Path
 
-    _print_table(pd.DataFrame(items))
+    if _quiet(cfg):
+        print(QUIET_NOTE.format("; the proposed admissions are in the files below"))
+    else:
+        _print_table(pd.DataFrame(items))
     print(f"\nwrote {cand}\nwrote {yml}")
     sel.to_csv(run.path / "admission_candidates.csv", index=False)
     run.finish(n_admissions=len(sel), n_eligible=n_elig, proposed=[i["hadm_id"] for i in items])
@@ -234,10 +256,14 @@ def _selected_ids(cfg: dict, args: argparse.Namespace | None = None) -> list[int
     if hadm_ids and split:
         raise ConfigError("give either --hadm-ids or --split, not both")
     if hadm_ids:
-        return [int(h) for h in hadm_ids]
-    if split:
-        return _split_ids(cfg, split)
-    return load_selected_hadm_ids(project_root(cfg) / "config" / "selected_admissions.yaml")
+        ids = [int(h) for h in hadm_ids]
+    elif split:
+        ids = _split_ids(cfg, split)
+    else:
+        ids = load_selected_hadm_ids(project_root(cfg) / "config" / "selected_admissions.yaml")
+    for h in ids:
+        anonymize.active().register(h)    # full data: known to the output guard before anything is printed
+    return ids
 
 
 def _units_dir(cfg: dict) -> "Path":
@@ -265,7 +291,14 @@ def cmd_build_units(args: argparse.Namespace) -> int:
     run = start_run(cfg, "build-units", command="build-units", seed=seed)
     ids = _selected_ids(cfg, args)
     out = _units_dir(cfg)
-    counts, dropped = build_all(load_tables(cfg), ids, cfg["units"], out)
+    tables = load_tables(cfg)
+    if anonymize.active().enabled:    # full data: the patients' ids are known to the output guard too
+        adm = tables["admissions"]
+        targets = set(ids)
+        for h, s in zip(adm["hadm_id"], adm["subject_id"]):
+            if int(h) in targets:
+                anonymize.active().register(h, s)
+    counts, dropped = build_all(tables, ids, cfg["units"], out)
     counts.to_csv(out / "unit_counts.csv", index=False)
     counts.to_csv(run.path / "unit_counts.csv", index=False)
     dropped_df = pd.DataFrame(dropped, columns=["hadm_id", "unit_type", "reason", "detail", "n_rows"])
@@ -273,7 +306,9 @@ def cmd_build_units(args: argparse.Namespace) -> int:
     dropped_df.to_csv(run.path / "dropped.csv", index=False)
 
     print("== Unit counts by type per admission")
-    _print_table(pd.concat([counts, pd.DataFrame([{"hadm_id": "TOTAL", **counts.drop(columns="hadm_id").sum()}])]))
+    shown = _admission_column(counts)
+    _print_table(pd.concat([shown, pd.DataFrame([{shown.columns[0]: "TOTAL",
+                                                  **counts.drop(columns="hadm_id").sum()}])]))
 
     if _quiet(cfg):
         print("\n" + QUIET_NOTE.format(f"; units and headers are in {out}"))
@@ -350,7 +385,7 @@ def cmd_retrieve(args: argparse.Namespace) -> int:
         if res.truncated_by_total_cap:
             print(f"\n  dropped by max_units_total: {res.truncated_by_total_cap}")
         print(f"\n  evidence order: {res.evidence}")
-    trunc = {h: len(r.truncated_by_total_cap) for h, r in results.items()}
+    trunc = {anonymize.label(h): len(r.truncated_by_total_cap) for h, r in results.items()}
     print(f"\nunits dropped by max_units_total per admission: {trunc}")
     print(f"run: {run.path}")
     revs = enc.revisions()
@@ -392,7 +427,9 @@ def cmd_export_relevance(args: argparse.Namespace) -> int:
     csv_path, side = write_export(run.path, items, texts)
     n_rows = sum(1 for _ in csv_path.open(encoding="utf-8")) - 1
     print(f"sampled {len(pairs)} of {len(all_pairs)} (admission, query) pairs with seed {seed}")
-    for h, q in pairs:
+    if _quiet(cfg):   # the queries name the primary diagnosis
+        print(QUIET_NOTE.format(f"; the sampled pairs are in {run.path / 'run_meta.json'}"))
+    for h, q in ([] if _quiet(cfg) else pairs):
         print(f"  {h}: {q}")
     print(f"\nwrote {csv_path} ({n_rows} rows to label; fill 'relevant' with 0/1)\nwrote {side}")
     print(POOLING_NOTE)
@@ -539,8 +576,7 @@ def cmd_enforce_filter(args: argparse.Namespace) -> int:
     run.write_json("run_meta.json", run.meta)
     print(f"run: {run.path}")
     try:
-        totals = filter_generation_runs(cfg, gen_dirs, run.path, args.conditions,
-                                        log=(lambda s: None) if _quiet(cfg) else print)
+        totals = filter_generation_runs(cfg, gen_dirs, run.path, args.conditions)
     except (OSError, ValueError) as e:
         print(f"STOP - {e}", file=sys.stderr)
         run.finish(status="failed", error=repr(e))
@@ -616,7 +652,7 @@ def cmd_context_tokens(args: argparse.Namespace) -> int:
     except (BackendError, OSError) as e:
         print(f"STOP - could not count tokens: {e}", file=sys.stderr)
         return 4
-    _print_table(pd.DataFrame(rows))
+    _print_table(_admission_column(pd.DataFrame(rows)))
     limit = cfg["generation"]["max_context_tokens"]
     how = "exact, model tokenizer" if all(r["tokens_exact"] for r in rows) else "approximate, chars/4"
     print(f"\n{sum(r['fits'] for r in rows)}/{len(rows)} admissions fit max_context_tokens = {limit:,} "
@@ -1166,14 +1202,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     from ehr_rag.data.load import SchemaError
 
-    try:
-        return args.func(args)
-    except ConfigError as e:
-        print(f"CONFIG ERROR: {e}", file=sys.stderr)
-        return 2
-    except SchemaError as e:
-        print(f"STOP - SCHEMA MISMATCH: {e}", file=sys.stderr)
-        return 3
+    # With credentialed data everything written to stdout or stderr below, errors included,
+    # shows adm_001... instead of a hadm_id or subject_id.
+    with anonymize.shared_output(_aliases(args.config)) as aliases:
+        try:
+            return args.func(args)
+        except ConfigError as e:
+            print(f"CONFIG ERROR: {e}", file=sys.stderr)
+            return 2
+        except SchemaError as e:
+            print(f"STOP - SCHEMA MISMATCH: {e}", file=sys.stderr)
+            return 3
+        except Exception:
+            if not aliases.enabled:
+                raise
+            # Printed here, while the streams are still scrubbed: Python would print the traceback
+            # after this block, ids and all. Same exit status as an uncaught exception.
+            import traceback
+
+            traceback.print_exc()
+            return 1
 
 
 if __name__ == "__main__":

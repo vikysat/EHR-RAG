@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
+from ehr_rag import anonymize
 from ehr_rag.config import project_root, resolve_path
 from ehr_rag.eval.parse import parse_report
 from ehr_rag.evidence.build_units import read_header, units_dir
@@ -433,7 +434,9 @@ def run_audit(
             row.update(n_dropped=es["n_dropped"], n_repaired=es["n_repaired"], n_retreated=es["n_retreated"])
         _write_json(d / "case.json", row)
         rows.append(row)
-        log(f"  [{i}/{len(cases)}] {c.condition} {c.case_id}: {status}")
+        # the original's case id is "<hadm_id>__original": shown with the admission's shared label
+        shown = f"{anonymize.label(c.hadm_id)}__original" if c.kind == "original" else c.case_id
+        log(f"  [{i}/{len(cases)}] {c.condition} {shown}: {status}")
     _write_csv(run.path / "audit_cases.csv", rows, AUDIT_CASE_COLUMNS)
     _write_json(run.path / "audit_run_meta.json", {"targets_run": targets_dir.name, "conditions": conditions,
                                                    "hadm_ids": hadm_ids})

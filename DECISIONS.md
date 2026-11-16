@@ -186,7 +186,31 @@ better than it is, never guesses, and keeps the raw data for manual review.
   and again in `generate` for unit files read from disk).
 - **Counts only on full data:** with `data.source: full`, every command that used to
   print units, retrieved sections or report sentences writes them to its run folder
-  instead (`evaluate` writes `gate_sample.json`). Ids and counts are still printed.
+  instead (`evaluate` writes `gate_sample.json`). Counts are still printed; ids are not
+  (next point).
+- **No hadm_id or subject_id in shared output** (full data only; `ehr_rag/anonymize.py`).
+  stdout, stderr and the SLURM logs are meant to be shared, the run folders are not.
+  - An admission is printed as `adm_NNN`: its position in the dev list followed by the
+    test list (the sorted, hash-checked id files), so one admission has one number in
+    every command, shard and run. Admissions outside the cohort (`--hadm-ids`, or no
+    cohort lists) get the next numbers in the order a command meets them, so those
+    numbers are only fixed within one run.
+  - Each run folder gets `admission_aliases.csv` (`alias,hadm_id,subject_id`), written
+    when the run starts and again when the command ends. Nothing else in the run
+    folders changes: directory names, `run_meta.json`, CSVs keep the real ids.
+  - Per-admission lines and tables use the alias directly (`build-units` counts,
+    `retrieve` units dropped, `context-tokens`, `generate` / `enforce-filter` /
+    `run-audit` progress). `inspect-data` prints no rows, `select-admissions` no
+    proposal table, `export-relevance` no query list (the queries name the diagnosis).
+  - Everything else is caught by a filter on stdout and stderr that replaces every
+    known id written as a whole number, also inside file names: error messages and
+    tracebacks. An uncaught exception is printed inside that filter and the command
+    exits with status 1, as Python would. Known ids = the cohort lists, the unit
+    headers on disk (which give the subject ids) and the command's own admissions.
+  - The filter only replaces numbers of 5 or more digits; shorter ones cannot be told
+    from counts (MIMIC-IV ids have 8 digits). The explicit labels have no such limit.
+  - `enforce-filter` used to print nothing per admission on full data; it now prints
+    its progress lines with the alias.
 
 ## Sharded generation
 

@@ -23,6 +23,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Callable
 
+from ehr_rag import anonymize
 from ehr_rag.checker.rules import AdmissionContext, Checker, LineCheck
 from ehr_rag.config import SECTIONS
 from ehr_rag.eval.parse import ABSTENTION_TEXT, Sentence, parse_line, parse_report
@@ -236,5 +237,6 @@ def filter_generation_runs(
                 ctx = checker.admission(frozen_units(shown, units), units)
                 s = enforce_dir(dest, ctx, checker, "filter", checker_meta=meta)
                 add_summaries(totals.setdefault(name, {}), s)
-                log(f"  {name} hadm {d.name}: kept {s['n_kept']}, dropped {s['n_dropped']} of {s['n_lines']}")
+                log(f"  {name} {anonymize.admission(int(d.name))}: kept {s['n_kept']}, dropped {s['n_dropped']} "
+                    f"of {s['n_lines']}")
     return totals

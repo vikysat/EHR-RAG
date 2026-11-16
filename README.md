@@ -125,6 +125,18 @@ which reads the cohort id list and checks it against `config/cohort/<split>_hadm
 With `data.source: full`, commands print counts only; examples (units, retrieval
 sections, the 10-sentence check, perturbation examples) stay in the run folder.
 
+stdout, stderr and the logs made from them never show a `hadm_id` or `subject_id` on
+full data (`ehr_rag/anonymize.py`). Progress lines and per-admission tables name an
+admission `adm_001`, `adm_002`, ...: its position in the dev id list followed by the
+test id list (each sorted), so the number is the same in every command, shard and run;
+an admission outside the cohort gets the next free number. Error messages and
+tracebacks pass through the same filter (the id, also inside a file name, becomes
+`adm_NNN`; a patient's id becomes `subj_NNN`, the number of the patient's first
+admission). The real ids stay in the run folders: each run has
+`admission_aliases.csv` (`alias,hadm_id,subject_id`), and folder names, CSV and JSON
+files there are unchanged. `inspect-data`, `select-admissions` and `export-relevance`
+print no rows, proposal table or query list on full data. With the Demo nothing changes.
+
 The current admission's discharge summary never enters the evidence: `load_tables`
 refuses a data root that contains any note table (`discharge*`, `radiology*`, or a
 `note/` directory), and `build-units` and `generate` refuse units whose

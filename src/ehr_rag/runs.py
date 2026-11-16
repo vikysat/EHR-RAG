@@ -2,7 +2,9 @@
 
 Every run writes ``config.yaml`` (the resolved config) and ``run_meta.json``
 (command, argv, seed, timestamps, platform and package versions). ``finish``
-adds the end timestamp and status.
+adds the end timestamp and status. With credentialed data the run also gets
+``admission_aliases.csv``: the real ids behind the ``adm_001``... of the shared
+output (``ehr_rag/anonymize.py``).
 """
 
 from __future__ import annotations
@@ -165,4 +167,7 @@ def start_run(
     }
     run = Run(run_id=run_id, path=path, meta=meta)
     run.write_json("run_meta.json", meta)
+    from ehr_rag import anonymize
+
+    anonymize.active().attach(path)    # full data: the real ids of adm_001... stay in the run folder
     return run
