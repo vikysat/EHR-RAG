@@ -19,6 +19,11 @@ better than it is, never guesses, and keeps the raw data for manual review.
   saved unit id, type or text differs from the current unit files.
 - **Format retry.** One retry: the original prompt plus a reminder that lists the
   problems. The confirmation threshold counts only new (uncached) calls.
+- **`max_tokens` is 4096** (was 1500): `full_context` reports on the full cohort were cut
+  off at 1500 new tokens. A cut-off attempt has `finish_reason: length` in its `call.json`
+  (`eos` when the model stopped by itself). `max_tokens` is part of the response-cache key,
+  so responses cached with 1500 are not reused; every condition is generated again under
+  the new limit.
 
 ## Phase 5: evaluation
 
