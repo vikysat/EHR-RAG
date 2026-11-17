@@ -32,6 +32,11 @@ pytestmark = pytest.mark.skipif(not _demo_root().is_dir(), reason="MIMIC-IV Demo
 
 @pytest.fixture()
 def demo_project(tmp_path: Path) -> dict[str, Any]:
+    return build_demo_project(tmp_path, realistic_responder)
+
+
+def build_demo_project(tmp_path: Path, responder: Any) -> dict[str, Any]:
+    """Demo units, a fake-encoder retrieve run and a FAKE-backend ehr_rag generation run in tmp_path."""
     from ehr_rag.config import load_config
     from ehr_rag.data.load import load_tables
     from ehr_rag.evidence.build_units import build_all, units_dir
@@ -59,9 +64,9 @@ def demo_project(tmp_path: Path) -> dict[str, Any]:
         units = read_units(out / f"{h}.jsonl")
         rrun.write_json(f"retrieval/{h}.json", evidence_record(retrieve_admission(units, enc, cfg["retrieval"]), units))
     gen = start_run(cfg, "generate", command="generate")
-    run_generation(cfg, gen, FakeBackend(realistic_responder), hadm_ids=HADM, conditions=["ehr_rag"],
+    run_generation(cfg, gen, FakeBackend(responder), hadm_ids=HADM, conditions=["ehr_rag"],
                    retrieval_run=rrun.run_id, log=lambda s: None)
-    return {"cfg_path": cfg_path, "root": tmp_path, "gen": gen.run_id}
+    return {"cfg_path": cfg_path, "root": tmp_path, "gen": gen.run_id, "cfg": cfg}
 
 
 def test_audit_on_demo_units(demo_project: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
