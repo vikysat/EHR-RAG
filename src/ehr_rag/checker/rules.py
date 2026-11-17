@@ -497,10 +497,15 @@ class Checker:
         A direction word is attached to the nearest lab name within ``direction.window_tokens``;
         every lab-derived term is a claim of its own direction.
         """
+        return [c[:5] for c in self.direction_claim_spans(text, mentions)]
+
+    def direction_claim_spans(self, text: str, mentions: list[Mention]
+                              ) -> list[tuple[int, Mention, str, bool, str, int, int]]:
+        """``direction_claims`` plus the character span (start, end) of the word or term in ``text``."""
         _, tok = self._token_index(text)
         labs = [(k, m) for k, m in enumerate(mentions) if m.kind == "lab"]
         spans = [(m.start, m.end) for m in mentions]
-        claims: list[tuple[int, Mention, str, bool, str]] = []
+        claims: list[tuple[int, Mention, str, bool, str, int, int]] = []
         for direction, rx in self.dir_words.items():
             for w in rx.finditer(text):
                 if any(a <= w.start() < b for a, b in spans):
@@ -509,10 +514,11 @@ class Checker:
                 if near:
                     k, m = near
                     anchors = [tok(w.start()), tok(m.start)]
-                    claims.append((k, m, direction, self._negated(text, anchors, tok), w.group(0)))
+                    claims.append((k, m, direction, self._negated(text, anchors, tok), w.group(0), w.start(), w.end()))
         for k, m in enumerate(mentions):
             if m.kind == "term":
-                claims.append((k, m, m.term["direction"], self._negated(text, [tok(m.start)], tok), m.surface))
+                claims.append((k, m, m.term["direction"], self._negated(text, [tok(m.start)], tok), m.surface,
+                               m.start, m.end))
         return claims
 
     def direction_holds(self, units: list[EvidenceUnit], direction: str, stated: list[Decimal]) -> bool | None:
