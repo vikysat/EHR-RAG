@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -946,6 +946,101 @@ def cmd_analyze_audit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_probe_targets(args: argparse.Namespace) -> int:
+    """Citation-dependence probe: units and contexts from the plain ehr_rag reports (CPU). Counts only."""
+    from ehr_rag.perturb.run_pilot import PilotError
+    from ehr_rag.probe.runner import select_probe
+    from ehr_rag.probe.score import ProbeError
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    gen_dirs = [_run_dir(cfg, g, "generation") for g in args.generation_run]
+    run = start_run(cfg, "probe-targets", command="probe-targets", seed=cfg["probe"]["seed"], run_id=args.run_id)
+    try:
+        res = select_probe(cfg, gen_dirs, run)
+    except (ProbeError, PilotError, ConfigError) as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        run.finish(status="failed", error=str(e))
+        return 4
+    units = res["units"]
+
+    def count(key: Callable[[Any], str]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for u in units:
+            out[key(u)] = out.get(key(u), 0) + 1
+        return dict(sorted(out.items()))
+
+    n_ctx = {c: sum(1 for u in units if c in u.contexts) for c in
+             ("original", "cited_edit", "within_flag", "matched_null", "ablation")}
+    n_seq = sum(len(u.contexts) * (2 + ((2 + bool(u.number_alt_within)) if u.number else 0)) for u in units)
+    print(f"split: {res['split']}; admissions: {res['n_admissions']}; units: {len(units)} {count(lambda u: u.claim_kind)}; "
+          f"order {count(lambda u: u.order)}; corroborated {sum(1 for u in units if u.corroborated)}")
+    print(f"contexts: {n_ctx}")
+    print(f"expected forward passes: {n_seq} (one per scored continuation; run-probe prints the exact number "
+          "after de-duplication)")
+    print(f"skips: {sum(res['skip_reasons'].values())} {res['skip_reasons']}")
+    run.finish(generation_runs=args.generation_run, split=res["split"], n_units=len(units), n_contexts=n_ctx,
+               n_sequences=n_seq, skip_reasons=res["skip_reasons"])
+    print(f"run: {run.path}")
+    return 0
+
+
+def cmd_run_probe(args: argparse.Namespace) -> int:
+    """Citation-dependence probe: teacher-forced scoring (GPU, hf_local), resumable."""
+    from datetime import datetime
+
+    from ehr_rag import anonymize
+    from ehr_rag.config import project_root, validate_for_generation
+    from ehr_rag.generation.backends import BackendError, gpu_name
+    from ehr_rag.perturb.run_pilot import _read_json
+    from ehr_rag.probe import score
+    from ehr_rag.probe.runner import check_threshold_for_split, run_probe
+    from ehr_rag.runs import Run, start_run
+
+    cfg = load_config(args.config)
+    validate_for_generation(cfg)
+    tdir = _run_dir(cfg, args.targets_run, "probe-targets")
+    split = _read_json(tdir / "probe_meta.json")["split"]
+    try:
+        thr = check_threshold_for_split(cfg, split, args.threshold_sha256)
+    except score.ProbeError as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        return 4
+    if args.resume:
+        path = project_root(cfg) / "runs" / args.resume
+        meta = _read_json(path / "run_meta.json") if (path / "run_meta.json").exists() else {}
+        if meta.get("command") != "run-probe" or meta.get("targets_run") != args.targets_run:
+            raise ConfigError(f"--resume {args.resume}: not a run-probe run of targets run {args.targets_run}")
+        if meta.get("threshold_sha256") != (thr["sha256"] if thr else None) and split == "test":
+            raise ConfigError(f"--resume {args.resume}: started under a different threshold hash")
+        run = Run(args.resume, path, meta)
+        run.meta.setdefault("resumed_at", []).append(datetime.now().isoformat(timespec="seconds"))
+        run.meta.pop("status", None)
+        anonymize.active().attach(path)
+    else:
+        run = start_run(cfg, "run-probe", command="run-probe", seed=cfg["probe"]["seed"], run_id=args.run_id)
+    gen = cfg["generation"]
+    run.meta.update(targets_run=args.targets_run, split=split, backend=gen["backend"], model=gen["model"],
+                    gpu_name=gpu_name(), hf_hub_offline=os.environ.get("HF_HUB_OFFLINE"),
+                    threshold_sha256=thr["sha256"] if thr else None)
+    run.write_json("run_meta.json", run.meta)
+    print(f"run: {run.path}")
+    try:
+        res = run_probe(cfg, tdir, run, score.make_scorer(gen), resume=bool(args.resume))
+    except (score.ProbeError, BackendError, OSError, ValueError) as e:
+        print(f"STOP - probe failed: {e}", file=sys.stderr)
+        run.finish(status="failed", error=repr(e))
+        return 4
+    except BaseException as e:
+        run.finish(status="interrupted", error=repr(e))
+        raise
+    print(f"\nunits: {res['n_units']}; sequences: {res['n_sequences']} ({res['n_already']} from before, "
+          f"{res['n_scored_now']} scored now); boundary merges: {res['n_boundary_merge']}")
+    run.finish(model_revision=res["revision"], n_sequences=res["n_sequences"], n_scored_now=res["n_scored_now"])
+    print(f"run: {run.path}")
+    return 0
+
+
 def cmd_make_tables(args: argparse.Namespace) -> int:
     """Markdown versions of the paper's tables from finished runs; counts only on stdout."""
     from pathlib import Path
@@ -1167,6 +1262,19 @@ def build_parser() -> argparse.ArgumentParser:
             "term survival, null-edit churn, manual-check CSV.")
     p.add_argument("--audit-run", required=True, nargs="+", help="run id(s) of `run-audit` runs (shards)")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
+    p = add("probe-targets", cmd_probe_targets,
+            "Citation-dependence probe: first lab-direction claim per lab group in each plain ehr_rag report, with "
+            "original / cited-edit / within-flag / matched-null / ablation contexts.")
+    p.add_argument("--generation-run", required=True, nargs="+", help="run id(s) with plain ehr_rag reports")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
+    p = add("run-probe", cmd_run_probe,
+            "Citation-dependence probe: teacher-forced log-probabilities (hf_local, forward passes only); "
+            "writes after every batch and resumes with --resume.")
+    p.add_argument("--targets-run", required=True, help="run id of a `probe-targets` run")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
+    g.add_argument("--resume", help="run id of an interrupted run-probe run to continue")
+    p.add_argument("--threshold-sha256", help="required on the test split: the sha256 printed by probe-threshold")
     p = add("make-tables", cmd_make_tables,
             "Markdown tables (support, audit, enforcement, checker profile, reference metrics) with 95%% CIs.")
     p.add_argument("--evaluate-run", help="run id of an `evaluate` run (table 1)")

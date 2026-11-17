@@ -26,7 +26,7 @@ from __future__ import annotations
 import copy
 import random
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Any
 
 from ehr_rag.evidence.render import effective_ref, lab_marker, render
@@ -264,9 +264,42 @@ def audit_edit(unit: EvidenceUnit, group: str | None, outside_fraction: float,
 #
 # ``within_flag_edit`` (citation-dependence probe) multiplies EVERY shown measurement of a lab unit
 # by the same factor 1 +/- pct/100, pct in ``probe.within_flag_percent`` [low, high] (whole
-# percents), tried in an order shuffled with ``seed``. The first factor is used for which, at each
-# point's original precision, every point changes, keeps its marker ([HIGH]/[LOW]/none), stays
-# inside the physiologic bounds, and the unit stays consistent. Flags and n_abnormal are unchanged.
+# percents), tried in an order shuffled with ``seed``. Each scaled value is rounded to its point's
+# original precision and then clamped to stay STRICTLY within its band, the side of the reference
+# range it was on: normal -> ref_low < v < ref_high, high -> v > ref_high, low -> 0 < v < ref_low,
+# intersected with the physiologic bounds (all at the point's precision). If any point's band holds
+# no value at its precision, the edit is skipped. The first factor for which every point changes
+# and the unit stays consistent is used. Flags and n_abnormal are unchanged.
+
+
+def in_band_limits(fields: dict[str, Any], point: str, bounds: Bounds | None) -> tuple[Decimal, Decimal | None] | None:
+    """(lowest, highest or None) value at the point's precision strictly inside its band; None if empty."""
+    value = fields[point]["value"]
+    places = decimal_places(value)
+    ulp = Decimal(1).scaleb(-places)
+    lo, hi = (Decimal(x) for x in effective_ref(fields["ref_low"], fields["ref_high"]))
+    m = _marker(fields, fields[point], value)
+    a: Decimal
+    b: Decimal | None
+    q = ulp
+    above_lo = lo.quantize(q, rounding=ROUND_FLOOR) + ulp      # smallest value at this precision > ref_low
+    below_hi = hi.quantize(q, rounding=ROUND_CEILING) - ulp    # largest value at this precision < ref_high
+    if m == "[HIGH]":
+        a, b = hi.quantize(q, rounding=ROUND_FLOOR) + ulp, None
+    elif m == "[LOW]":
+        a, b = ulp, lo.quantize(q, rounding=ROUND_CEILING) - ulp
+    else:
+        a, b = above_lo, below_hi
+    a = max(a, ulp)                                   # strictly positive
+    if bounds is not None:
+        if bounds[0] is not None:
+            a = max(a, bounds[0].quantize(q, rounding=ROUND_CEILING))
+        if bounds[1] is not None:
+            top = bounds[1].quantize(q, rounding=ROUND_FLOOR)
+            b = top if b is None else min(b, top)
+    if b is not None and a > b:
+        return None
+    return a, b
 
 
 def within_flag_edit(unit: EvidenceUnit, percent: list[int], seed: str, bounds: Bounds | None = None) -> EditResult:
@@ -282,6 +315,10 @@ def within_flag_edit(unit: EvidenceUnit, percent: list[int], seed: str, bounds: 
     points = [p for p in LAB_POINTS if f0.get(p)]
     if any(Decimal(f0[p]["value"]) == 0 for p in points):
         raise SkipEdit("a shown value is 0; a relative change is undefined")
+    limits = {p: in_band_limits(f0, p, bounds) for p in points}
+    empty = [p for p, lim in limits.items() if lim is None]
+    if empty:
+        raise SkipEdit(f"no valid in-band value for {', '.join(empty)} at its precision")
     lo_pct, hi_pct = int(percent[0]), int(percent[1])
     options = [(sign, pct) for pct in range(lo_pct, hi_pct + 1) for sign in (1, -1)]
     random.Random(seed).shuffle(options)
@@ -291,18 +328,17 @@ def within_flag_edit(unit: EvidenceUnit, percent: list[int], seed: str, bounds: 
         ok = True
         for p in points:
             v = Decimal(f0[p]["value"])
-            new = v * factor
-            if clamp(new, bounds) != new:
+            places = decimal_places(f0[p]["value"])
+            new = clamp(Decimal(fmt(v * factor, places)), limits[p])
+            if new == v:
                 ok = False
                 break
-            s = fmt(new, decimal_places(f0[p]["value"]))
-            if Decimal(s) == v or _marker(f0, f0[p], s) != _marker(f0, f0[p], f0[p]["value"]):
-                ok = False
-                break
-            f[p]["value"] = s
+            f[p]["value"] = fmt(new, places)
         if ok and _consistent(f):
+            if any(_marker(f, f[p], f[p]["value"]) != _marker(f0, f0[p], f0[p]["value"]) for p in points):
+                raise AssertionError("within-flag edit changed a marker")      # the bands make this impossible
             original = " ".join(dict.fromkeys(f0[p]["value"] for p in points))
             edited = " ".join(dict.fromkeys(f[p]["value"] for p in points))
             return EditResult("within_flag", unit.unit_id, copy.deepcopy(f0), f, unit.text, render("lab", f),
                               original, edited)
-    raise SkipEdit("no within-flag change keeps every marker, the bounds and a consistent unit")
+    raise SkipEdit("no within-flag change moves every value inside its band and keeps the unit consistent")
