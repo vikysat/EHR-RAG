@@ -1041,6 +1041,85 @@ def cmd_run_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_probe_threshold(args: argparse.Namespace) -> int:
+    """Citation-dependence probe: 'not dependent' threshold from DEV matched-null / within-flag drops."""
+    from ehr_rag.config import resolve_path
+    from ehr_rag.perturb.run_pilot import _read_json
+    from ehr_rag.probe.analyze import derive_threshold, unit_scores, write_threshold
+    from ehr_rag.probe.score import ProbeError
+
+    cfg = load_config(args.config)
+    pdir = _run_dir(cfg, args.probe_run, "run-probe")
+    tname = _read_json(pdir / "run_meta.json")["targets_run"]
+    tdir = _run_dir(cfg, tname, "probe-targets")
+    split = _read_json(tdir / "probe_meta.json")["split"]
+    if split != "dev" and not (split == "demo" and cfg["data"]["source"] == "demo"):
+        print(f"STOP - the threshold is derived on DEV only; this probe run is on {split}", file=sys.stderr)
+        return 4
+    path = resolve_path(cfg, cfg["probe"]["threshold_file"])
+    if path.exists() and not args.overwrite:
+        print(f"STOP - {path} exists; give --overwrite to replace it (test runs pinned to the old hash will then "
+              "refuse)", file=sys.stderr)
+        return 4
+    q = cfg["probe"]["threshold_quantile"]
+    try:
+        payload = derive_threshold(unit_scores(tdir, [pdir]), q)
+    except ProbeError as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        return 4
+    body = write_threshold(path, {**payload, "split": split, "probe_run": pdir.name, "targets_run": tname})
+    print(f"threshold {body['threshold']:.4f} = {q} quantile of {body['n_null']} matched-null and "
+          f"{body['n_within_flag']} within-flag drops")
+    print(f"wrote {path}")
+    print(f"sha256 {body['sha256']}  (give it as --threshold-sha256 on test)")
+    return 0
+
+
+def cmd_analyze_probe(args: argparse.Namespace) -> int:
+    """Citation-dependence probe: per-unit scores and the headline with admission-bootstrap CIs (CPU)."""
+    from ehr_rag.perturb.run_pilot import _read_json
+    from ehr_rag.probe.analyze import nli_supported, summarize, summary_markdown, unit_scores, write_rows
+    from ehr_rag.probe.runner import check_threshold_for_split
+    from ehr_rag.probe.score import ProbeError
+    from ehr_rag.runs import start_run
+    from ehr_rag.stats import fmt_ci
+
+    cfg = load_config(args.config)
+    pdirs = [_run_dir(cfg, p, "run-probe") for p in args.probe_run]
+    tnames = {_read_json(p / "run_meta.json")["targets_run"] for p in pdirs}
+    if len(tnames) != 1:
+        raise ConfigError(f"probe runs of different targets runs: {sorted(tnames)}")
+    tdir = _run_dir(cfg, tnames.pop(), "probe-targets")
+    split = _read_json(tdir / "probe_meta.json")["split"]
+    try:
+        thr = check_threshold_for_split(cfg, split, args.threshold_sha256)
+        if thr is None:
+            raise ProbeError("no valid threshold file (run probe-threshold on a dev probe run)")
+        if split == "test" and any(_read_json(p / "run_meta.json").get("threshold_sha256") != thr["sha256"]
+                                   for p in pdirs):
+            raise ProbeError("a test probe run was scored under a different threshold hash")
+    except ProbeError as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        return 4
+    edir = _run_dir(cfg, args.evaluate_run, "evaluate")
+    run = start_run(cfg, "analyze-probe", command="analyze-probe", seed=cfg["probe"]["seed"], run_id=args.run_id)
+    rows = unit_scores(tdir, pdirs)
+    nli_supported(edir, rows, tdir)
+    s = summarize(rows, thr, cfg["probe"]["bootstrap_resamples"], cfg["probe"]["seed"])
+    write_rows(run.path / "probe_units_scored.csv", rows)
+    run.write_json("probe_summary.json", {**s, "split": split, "probe_runs": args.probe_run,
+                                          "evaluate_run": args.evaluate_run})
+    (run.path / "probe_summary.md").write_text(summary_markdown(s, args.probe_run), encoding="utf-8", newline="\n")
+    print(f"split {split}; threshold {s['threshold']:.4f}; units {s['n_units']}, scored {s['n_scored']}, "
+          f"NLI-supported {s['n_supported']}")
+    for k, d in s["splits"].items():
+        print(f"  {k:<28} {d['n_units']:>5} units  not dependent {fmt_ci(d['share'])}")
+    print(f"  number control: mean dependence {fmt_ci(s['number_control']['mean_num_dependence'])}")
+    print(f"wrote probe_units_scored.csv, probe_summary.json/md to {run.path}")
+    run.finish(probe_runs=args.probe_run, split=split, threshold_sha256=thr["sha256"], n_units=s["n_units"])
+    return 0
+
+
 def cmd_make_tables(args: argparse.Namespace) -> int:
     """Markdown versions of the paper's tables from finished runs; counts only on stdout."""
     from pathlib import Path
@@ -1050,13 +1129,14 @@ def cmd_make_tables(args: argparse.Namespace) -> int:
 
     cfg = load_config(args.config)
     dirs = {k: (_run_dir(cfg, getattr(args, k), k) if getattr(args, k) else None)
-            for k in ("evaluate_run", "check_run", "text_metrics_run", "audit_run")}
+            for k in ("evaluate_run", "check_run", "text_metrics_run", "audit_run", "probe_run")}
     if not any(dirs.values()):
-        raise ConfigError("give at least one of --evaluate-run, --check-run, --text-metrics-run, --audit-run")
+        raise ConfigError("give at least one of --evaluate-run, --check-run, --text-metrics-run, --audit-run, "
+                          "--probe-run")
     manual = Path(args.manual_labels) if args.manual_labels else None
     run = start_run(cfg, "make-tables", command="make-tables", seed=cfg["audit"]["seed"], run_id=args.run_id)
     counts = make_tables(run.path, eval_dir=dirs["evaluate_run"], manual=manual, check_dir=dirs["check_run"],
-                         tm_dir=dirs["text_metrics_run"], audit_dir=dirs["audit_run"],
+                         tm_dir=dirs["text_metrics_run"], audit_dir=dirs["audit_run"], probe_dir=dirs["probe_run"],
                          n=cfg["audit"]["bootstrap_resamples"], seed=cfg["audit"]["seed"])
     for name, k in counts.items():
         print(f"table {name}: {k} rows")
@@ -1275,13 +1355,26 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     g.add_argument("--resume", help="run id of an interrupted run-probe run to continue")
     p.add_argument("--threshold-sha256", help="required on the test split: the sha256 printed by probe-threshold")
+    p = add("probe-threshold", cmd_probe_threshold,
+            "Citation-dependence probe: write the 'not dependent' threshold (DEV matched-null and within-flag "
+            "drops) to probe.threshold_file with its sha256.")
+    p.add_argument("--probe-run", required=True, help="run id of a `run-probe` run on dev")
+    p.add_argument("--overwrite", action="store_true", help="replace an existing threshold file")
+    p = add("analyze-probe", cmd_analyze_probe,
+            "Citation-dependence probe: per-unit scores and the share of NLI-supported claims that do not depend "
+            "on the cited unit, with admission-bootstrap CIs.")
+    p.add_argument("--probe-run", required=True, nargs="+", help="run id(s) of `run-probe` runs")
+    p.add_argument("--evaluate-run", required=True, help="run id of an `evaluate` run of the same reports (NLI)")
+    p.add_argument("--threshold-sha256", help="required on the test split: the sha256 printed by probe-threshold")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("make-tables", cmd_make_tables,
-            "Markdown tables (support, audit, enforcement, checker profile, reference metrics) with 95%% CIs.")
+            "Markdown tables (support, audit, enforcement, checker profile, reference metrics, probe) with 95%% CIs.")
     p.add_argument("--evaluate-run", help="run id of an `evaluate` run (table 1)")
     p.add_argument("--manual-labels", help="labeled manual_review.csv (table 1, manual unsupported)")
     p.add_argument("--check-run", help="run id of a `check-citations` run (tables 3 and 4)")
     p.add_argument("--text-metrics-run", help="run id of a `text-metrics` run (table 5)")
     p.add_argument("--audit-run", help="run id of an `analyze-audit` run (table 2)")
+    p.add_argument("--probe-run", help="run id of an `analyze-probe` run (table 6)")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("run-pilot", cmd_run_pilot,
             "Phase 6: frozen-evidence regenerations for every edit plus unperturbed controls.")

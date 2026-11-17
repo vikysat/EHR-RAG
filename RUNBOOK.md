@@ -515,3 +515,64 @@ python -m ehr_rag.cli make-tables --config config/full.yaml --evaluate-run <EVAL
     --text-metrics-run <TM_TEST> --audit-run <AUDIT_TEST>
 ```
 The tables are in `runs/<MAKE_TABLES_RUN>/tables.md`; stdout shows row counts only.
+
+---
+
+## 13. Citation-dependence probe (plain ehr_rag; GPU machine = plain Jupyter terminal, nohup)
+
+Forward passes only (teacher forcing), `generation.backend: hf_local`. Needs the plain `ehr_rag`
+reports (10.6 dev, 11.4 test) and an `evaluate` run of the same reports (10.7 / 12.3).
+Results are written after every batch; a session that ends (~5 h) is continued with `--resume`.
+
+### 13.1 Dev: probe, then derive and commit the threshold
+
+```bash
+source .venv/bin/activate && export HF_HUB_OFFLINE=1
+DEV_SHARDS=$(ls runs | grep -- "-generate-job<dev jobid>-shard")
+python -m ehr_rag.cli probe-targets --config config/full.yaml --generation-run $DEV_SHARDS      # -> PROBE_TARGETS_DEV
+```
+It prints units, contexts, skip reasons and `expected forward passes: N`. Then on the GPU:
+```bash
+RID=$(date +%Y%m%d-%H%M%S)-run-probe-dev; mkdir -p runs/$RID; echo $RID
+nohup python -m ehr_rag.cli run-probe --config config/full.yaml --targets-run <PROBE_TARGETS_DEV> \
+    --run-id $RID > runs/$RID/stdout.log 2>&1 &
+head -4 runs/$RID/stdout.log        # exact forward passes after de-duplication; already scored / to run
+tail -f runs/$RID/stdout.log        # one line per batch (Ctrl-C stops tail, not the job)
+```
+If the session ends before the last batch, in the new session (same RID):
+```bash
+source .venv/bin/activate && export HF_HUB_OFFLINE=1
+nohup python -m ehr_rag.cli run-probe --config config/full.yaml --targets-run <PROBE_TARGETS_DEV> \
+    --resume $RID >> runs/$RID/stdout.log 2>&1 &
+```
+Repeat until the log ends with `units: ...; sequences: ...` and `"status": "ok"` is in
+`runs/$RID/run_meta.json`. Batches per hour (to plan test): count `batch` lines in the log.
+If CUDA runs out of memory, set `probe.batch_size` lower (the plan is unchanged, so `--resume` still works).
+
+```bash
+python -m ehr_rag.cli probe-threshold --config config/full.yaml --probe-run $RID     # prints sha256 -> PROBE_SHA
+python -m ehr_rag.cli analyze-probe --config config/full.yaml --probe-run $RID --evaluate-run <EVAL_DEV>
+git add config/probe_threshold.yaml && git commit -m "Freeze probe threshold from dev" && git push origin main
+```
+`config/probe_threshold.yaml` holds only the threshold, counts, quantile and run ids. Never re-derive it after
+looking at test.
+
+### 13.2 Test (refuses to run unless the threshold file is unchanged)
+
+```bash
+source .venv/bin/activate && export HF_HUB_OFFLINE=1
+TEST_SHARDS=$(ls runs | grep -- "-generate-job<test jobid>-shard")
+python -m ehr_rag.cli probe-targets --config config/full.yaml --generation-run $TEST_SHARDS    # -> PROBE_TARGETS_TEST
+RID=$(date +%Y%m%d-%H%M%S)-run-probe-test; mkdir -p runs/$RID; echo $RID
+nohup python -m ehr_rag.cli run-probe --config config/full.yaml --targets-run <PROBE_TARGETS_TEST> \
+    --threshold-sha256 $PROBE_SHA --run-id $RID > runs/$RID/stdout.log 2>&1 &
+# after a session ends:
+nohup python -m ehr_rag.cli run-probe --config config/full.yaml --targets-run <PROBE_TARGETS_TEST> \
+    --threshold-sha256 $PROBE_SHA --resume $RID >> runs/$RID/stdout.log 2>&1 &
+python -m ehr_rag.cli analyze-probe --config config/full.yaml --probe-run $RID --evaluate-run <EVAL_TEST> \
+    --threshold-sha256 $PROBE_SHA                                                               # -> PROBE_TEST
+python -m ehr_rag.cli make-tables --config config/full.yaml --evaluate-run <EVAL_TEST> \
+    --manual-labels runs/<EVAL_TEST>/manual_review_labeled.csv --check-run <CHECK_TEST> \
+    --text-metrics-run <TM_TEST> --audit-run <AUDIT_TEST> --probe-run <PROBE_TEST>
+```
+Table 6 (`table_6_probe.md`) is the probe; stdout shows counts and shares only.

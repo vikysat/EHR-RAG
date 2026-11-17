@@ -92,7 +92,11 @@ Every command that produces results writes `runs/<YYYYMMDD-HHMMSS-name>/`, conta
 | 14a | `audit-targets --generation-run <id...>` | CPU | counterfactual audit targets: per admission up to 3 cited labs (flagged first) + 1 uncited null-edit lab; edits to the other side of the reference range: `audit_targets.csv`, `audit_edits.jsonl`, `audit_skips.csv` |
 | 14b | `run-audit --targets-run <id>` | GPU (`scripts/audit_array.sbatch`) | regenerations with the edited unit in the frozen evidence, for `ehr_rag` and `ehr_rag_enforced` (frozen checker + rewrite); shardable over admissions |
 | 14c | `analyze-audit --audit-run <id...>` | CPU | Follows / Stale / Dropped / Other per (original claim, edited unit); faithfulness with 95% bootstrap CIs (paired plain vs enforced); term survival; null-edit churn; `audit_manual_check.csv` (50 pairs) |
-| 16 | `make-tables [--evaluate-run] [--manual-labels] [--check-run] [--text-metrics-run] [--audit-run]` | CPU | the paper's tables as markdown with 95% CIs: `tables.md`, `table_*.md` |
+| 14d | `probe-targets --generation-run <id...>` | CPU | citation-dependence probe units (first lab-direction claim per lab group in each plain ehr_rag report that cites the matching lab) and their contexts: original, cited edit, within-flag edit, matched null, corroborator ablation; prints the expected forward passes: `probe_units.csv`, `probe_contexts.jsonl`, `probe_skips.csv` |
+| 14e | `run-probe --targets-run <id> [--resume <run id>] [--threshold-sha256 <sha>]` | GPU (`hf_local`, nohup) | teacher-forced log P(term) - log P(edit-consistent alternative), and the same for the number token, under each context; forward passes only, batched; `probe_scores.jsonl` written after every batch, `--resume` continues an interrupted run |
+| 14f | `probe-threshold --probe-run <dev id>` | CPU | "not dependent" threshold = `probe.threshold_quantile` of the DEV matched-null and within-flag drops, written to `probe.threshold_file` with its sha256 (test runs refuse a changed file) |
+| 14g | `analyze-probe --probe-run <id...> --evaluate-run <id> [--threshold-sha256 <sha>]` | CPU | per-unit dependence; share of NLI-supported claims below the threshold by order, corroboration and section, admission-bootstrap CIs: `probe_units_scored.csv`, `probe_summary.md/json` |
+| 16 | `make-tables [--evaluate-run] [--manual-labels] [--check-run] [--text-metrics-run] [--audit-run] [--probe-run]` | CPU | the paper's tables as markdown with 95% CIs: `tables.md`, `table_*.md` |
 | 15 | `notebooks/demo.ipynb` | any | one admission end to end from cached runs; no model calls |
 
 `generate` and `run-pilot` print the number of calls and the estimated input tokens
@@ -301,6 +305,33 @@ text only (no headers, citations or abstention lines).
   drug. Changes to Impression/Recommendations are stored as diffs; all lab_major and
   ambiguous cases are flagged for manual reading. Control stability is the fraction
   of control runs in which the original target sentence is unchanged.
+
+## Citation-dependence probe (as implemented)
+
+Does a supported lab-direction claim actually depend on the cited unit? Plain `ehr_rag` reports
+only; no generation, only forward passes with the original report teacher-forced.
+
+- **Unit**: the first direction claim per checker lab group in a report: a direction word attached
+  to a lab name (`elevated potassium`) or a lexicon term (`hyperkalemia`), found per claim with
+  `Checker.direction_claim_spans`; kept if not negated and the claim's citation group cites a shown
+  numeric lab of that group with a two-sided reference range. `order`: whether the claim's first
+  number matching the cited unit comes before or after the term (or there is none).
+- **Contexts** (same retrieved set and prompt): original; cited edit (the audit's flag flip);
+  within-flag edit (every value x (1 +/- 10-20 %), markers unchanged); matched null (the audit edit
+  of a shown lab cited nowhere in the report, with the cited unit's status); corroborator ablation
+  (other shown labs of the group, diagnosis titles containing a matching lexicon term, drugs in the
+  APPROXIMATE `probe.related_drugs`). Edited values are clamped to `probe.physiologic_bounds`
+  (never below 0).
+- **Score**: s = log P(term) - log P(alternative) at the term's position, each the sum over the
+  continuation's tokens; the alternative is consistent with the cited edit (`normal`, `elevated`,
+  `low`; for terms `normal <lab>` or the opposite term). Dependence = s(original) - s(cited edit).
+  Number token: alternative = the edited value (positive control).
+- **Threshold**: the 0.95 quantile of the DEV null and within-flag drops, written once to
+  `config/probe_threshold.yaml` with a sha256; test runs need `--threshold-sha256` and refuse a
+  changed file. **Headline**: among claims the NLI judged supported, the share with dependence
+  below the threshold, by order, corroboration and section; 1,000 admission-bootstrap resamples.
+- Forward passes = sequences: per unit and context 2 for the term, plus 3 for a number (original,
+  cited-edit value, within-flag value). Commands: RUNBOOK section 13.
 
 ## Known limitations
 

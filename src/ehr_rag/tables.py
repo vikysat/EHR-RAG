@@ -10,6 +10,8 @@ seeded with ``audit.seed``). Sources (each table is written only if its source i
   3 enforcement  check-citations run: enforcement_per_report.csv
   4 checker      check-citations run: checker_lines.jsonl (generated text, before enforcement)
   5 reference    text-metrics run: text_metrics.csv (mean F1 per condition)
+  6 probe        analyze-probe run: probe_summary.json (share of NLI-supported claims not dependent on the
+                 cited unit; its CIs are computed by analyze-probe with ``probe.bootstrap_resamples``)
 """
 
 from __future__ import annotations
@@ -177,8 +179,28 @@ def table_reference(tm_dir: Path, n: int, seed: int) -> tuple[list[str], int]:
     return lines + _md(header, rows), len(rows)
 
 
+# --------------------------------------------------------------------------- table 6: probe
+
+
+def table_probe(probe_dir: Path) -> tuple[list[str], int]:
+    s = json.loads((probe_dir / "probe_summary.json").read_text(encoding="utf-8"))
+    header = ["split", "supported units", "not dependent", "share not dependent"]
+    rows = [[k, str(d["n_units"]), str(d["n_not_dependent"]), fmt_ci(d["share"])] for k, d in s["splits"].items()]
+    nc = s["number_control"]
+    rows.append(["number token (positive control): share below threshold", str(nc["n_units"]), "",
+                 fmt_ci(nc["share_below_threshold"])])
+    lines = ["## Table 6. Teacher-forced citation-dependence probe (plain ehr_rag)", "",
+             "Claims judged supported by NLI. Dependence = drop in log P(term) - log P(edit-consistent alternative) "
+             "when the cited lab is edited across its reference range; not dependent = dependence < "
+             f"{s['threshold']:.3f} (threshold from DEV matched-null and within-flag edits, sha256 "
+             f"{str(s['threshold_sha256'])[:12]}...); split `{s.get('split')}`. 95% CI from bootstrap resamples "
+             "of admissions.", ""]
+    return lines + _md(header, rows), len(rows)
+
+
 def make_tables(out_dir: Path, *, eval_dir: Path | None, manual: Path | None, check_dir: Path | None,
-                tm_dir: Path | None, audit_dir: Path | None, n: int, seed: int) -> dict[str, int]:
+                tm_dir: Path | None, audit_dir: Path | None, n: int, seed: int,
+                probe_dir: Path | None = None) -> dict[str, int]:
     """Write ``table_<k>_<name>.md`` per available source and ``tables.md``; returns rows per table."""
     parts: list[tuple[str, tuple[list[str], int]]] = []
     if eval_dir:
@@ -190,8 +212,11 @@ def make_tables(out_dir: Path, *, eval_dir: Path | None, manual: Path | None, ch
         parts.append(("4_checker", table_checker(check_dir, n, seed)))
     if tm_dir:
         parts.append(("5_reference", table_reference(tm_dir, n, seed)))
+    if probe_dir:
+        parts.append(("6_probe", table_probe(probe_dir)))
     sources = {"evaluate": eval_dir, "manual labels": manual, "check-citations": check_dir,
-               "text-metrics": tm_dir, "analyze-audit": audit_dir}
+               "text-metrics": tm_dir, "analyze-audit": audit_dir,
+               "analyze-probe": probe_dir}
     doc = ["# Tables", "", "Sources: " + "; ".join(f"{k} `{v.name}`" for k, v in sources.items() if v), ""]
     counts = {}
     for name, (lines, n_rows) in parts:
