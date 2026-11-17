@@ -189,9 +189,43 @@ def apply_edit(unit: EvidenceUnit, edit_type: str, value: str, point_names: list
 # skipped if, after rounding, the markers are not all '' (to_normal) or all [HIGH]/[LOW].
 
 
+Bounds = tuple["Decimal | None", "Decimal | None"]
+
+
+def physiologic_bounds(table: dict[str, Any], group: str | None, uom: str | None) -> Bounds:
+    """(low, high) plausibility bounds of a lab group from ``probe.physiologic_bounds``.
+
+    An entry is ``[low, high]`` or a mapping ``uom -> [low, high]`` (labs reported in several units).
+    The low bound is never below 0 (no negative values); a group or uom without an entry gets (0, None).
+    """
+    e = table.get(group) if group else None
+    if isinstance(e, dict):
+        e = e.get(uom or "")
+    if not e:
+        return Decimal(0), None
+    lo, hi = (None if x is None else Decimal(str(x)) for x in e)
+    return max(lo if lo is not None else Decimal(0), Decimal(0)), hi
+
+
+def clamp(x: Decimal, bounds: Bounds | None) -> Decimal:
+    """``x`` moved into ``bounds`` (None: unchanged)."""
+    if bounds is None:
+        return x
+    lo, hi = bounds
+    if lo is not None and x < lo:
+        x = lo
+    if hi is not None and x > hi:
+        x = hi
+    return x
+
+
 def audit_edit(unit: EvidenceUnit, group: str | None, outside_fraction: float,
-               below_groups: list[str]) -> EditResult:
-    """Audit edit of one lab unit (see above). Raises SkipEdit."""
+               below_groups: list[str], bounds: Bounds | None = None) -> EditResult:
+    """Audit edit of one lab unit (see above). Raises SkipEdit.
+
+    ``bounds`` (probe only; the audit passes None): the new value is clamped into these physiologic
+    bounds before rounding; the edit is skipped if the clamped value no longer gives the wanted marker.
+    """
     from ehr_rag.perturb.select_targets import lab_status, range_skip_reason
 
     reason = range_skip_reason(unit)
@@ -212,6 +246,7 @@ def audit_edit(unit: EvidenceUnit, group: str | None, outside_fraction: float,
             raise SkipEdit(f"below-range value {new} is not positive")
     else:
         edit_type, new, flag, want = "to_high", hi + Decimal(str(outside_fraction)) * width, "abnormal", "[HIGH]"
+    new = clamp(new, bounds)
     value = fmt(new, places)
     f = copy.deepcopy(f0)
     for p in points:
@@ -223,3 +258,51 @@ def audit_edit(unit: EvidenceUnit, group: str | None, outside_fraction: float,
         raise SkipEdit(f"{value} at the original precision does not give marker {want or 'none'} ({sorted(marks)})")
     original = " ".join(dict.fromkeys(f0[p]["value"] for p in points))
     return EditResult(edit_type, unit.unit_id, copy.deepcopy(f0), f, unit.text, render("lab", f), original, value)
+
+
+# --------------------------------------------------------------------------- probe: within-flag edit
+#
+# ``within_flag_edit`` (citation-dependence probe) multiplies EVERY shown measurement of a lab unit
+# by the same factor 1 +/- pct/100, pct in ``probe.within_flag_percent`` [low, high] (whole
+# percents), tried in an order shuffled with ``seed``. The first factor is used for which, at each
+# point's original precision, every point changes, keeps its marker ([HIGH]/[LOW]/none), stays
+# inside the physiologic bounds, and the unit stays consistent. Flags and n_abnormal are unchanged.
+
+
+def within_flag_edit(unit: EvidenceUnit, percent: list[int], seed: str, bounds: Bounds | None = None) -> EditResult:
+    """Within-flag edit of one lab unit (see above). Raises SkipEdit."""
+    from ehr_rag.perturb.select_targets import range_skip_reason
+
+    reason = range_skip_reason(unit)
+    if reason:
+        raise SkipEdit(reason)
+    if unit.text != render(unit.unit_type, unit.fields):
+        raise SkipEdit("unit text does not equal render(fields); refusing to edit")
+    f0 = unit.fields
+    points = [p for p in LAB_POINTS if f0.get(p)]
+    if any(Decimal(f0[p]["value"]) == 0 for p in points):
+        raise SkipEdit("a shown value is 0; a relative change is undefined")
+    lo_pct, hi_pct = int(percent[0]), int(percent[1])
+    options = [(sign, pct) for pct in range(lo_pct, hi_pct + 1) for sign in (1, -1)]
+    random.Random(seed).shuffle(options)
+    for sign, pct in options:
+        factor = 1 + Decimal(sign * pct) / 100
+        f = copy.deepcopy(f0)
+        ok = True
+        for p in points:
+            v = Decimal(f0[p]["value"])
+            new = v * factor
+            if clamp(new, bounds) != new:
+                ok = False
+                break
+            s = fmt(new, decimal_places(f0[p]["value"]))
+            if Decimal(s) == v or _marker(f0, f0[p], s) != _marker(f0, f0[p], f0[p]["value"]):
+                ok = False
+                break
+            f[p]["value"] = s
+        if ok and _consistent(f):
+            original = " ".join(dict.fromkeys(f0[p]["value"] for p in points))
+            edited = " ".join(dict.fromkeys(f[p]["value"] for p in points))
+            return EditResult("within_flag", unit.unit_id, copy.deepcopy(f0), f, unit.text, render("lab", f),
+                              original, edited)
+    raise SkipEdit("no within-flag change keeps every marker, the bounds and a consistent unit")

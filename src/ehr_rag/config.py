@@ -107,6 +107,16 @@ SCHEMA: dict[str, Any] = {
         "bootstrap_resamples": _INT,
         "manual_check_n": _INT,
     },
+    "probe": {
+        "seed": _INT,
+        "within_flag_percent": _LIST,
+        "batch_size": _INT,
+        "threshold_quantile": _NUM,
+        "threshold_file": _STR,
+        "bootstrap_resamples": _INT,
+        "physiologic_bounds": (dict,),
+        "related_drugs": (dict,),
+    },
     "perturbation": {
         "n_targets": _INT,
         "max_targets_per_admission": _INT,
@@ -186,6 +196,23 @@ def validate_config(cfg: dict[str, Any]) -> None:
     for key in ("n_cited_per_admission", "n_null_per_admission", "bootstrap_resamples", "manual_check_n"):
         if au[key] < 0:
             raise ConfigError(f"audit.{key}: must be >= 0")
+    pr = cfg["probe"]
+    wf = pr["within_flag_percent"]
+    if len(wf) != 2 or not all(isinstance(x, int) and not isinstance(x, bool) for x in wf) or not 0 < wf[0] <= wf[1] < 100:
+        raise ConfigError("probe.within_flag_percent: must be [low, high] whole percents with 0 < low <= high < 100")
+    if pr["batch_size"] < 1 or pr["bootstrap_resamples"] < 0:
+        raise ConfigError("probe.batch_size must be >= 1 and probe.bootstrap_resamples >= 0")
+    if not 0 < pr["threshold_quantile"] < 1:
+        raise ConfigError("probe.threshold_quantile: must be in (0, 1)")
+    for g, e in pr["physiologic_bounds"].items():
+        for b in (e.values() if isinstance(e, dict) else [e]):
+            if not (isinstance(b, list) and len(b) == 2 and all(x is None or isinstance(x, (int, float)) for x in b)):
+                raise ConfigError(f"probe.physiologic_bounds.{g}: expected [low, high] or a mapping uom -> [low, high]")
+            if b[0] is not None and b[1] is not None and b[0] > b[1]:
+                raise ConfigError(f"probe.physiologic_bounds.{g}: low > high")
+    for g, e in pr["related_drugs"].items():
+        if not isinstance(e, dict) or any(k not in ("high", "low") or not isinstance(v, list) for k, v in e.items()):
+            raise ConfigError(f"probe.related_drugs.{g}: expected a mapping high/low -> list of drug names")
     co = cfg["cohort"]
     if not 0 < co["pool_fraction"] <= 1:
         raise ConfigError("cohort.pool_fraction: must be in (0, 1]")

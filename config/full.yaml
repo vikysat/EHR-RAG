@@ -94,6 +94,61 @@ audit:                         # counterfactual citation audit: audit-targets / 
   bootstrap_resamples: 1000    # faithfulness CIs, resampling admissions
   manual_check_n: 50
 
+probe:                         # citation-dependence probe: probe-targets / run-probe / probe-threshold / analyze-probe
+  seed: 13
+  within_flag_percent: [10, 20]  # within-flag edit: every shown value x (1 +/- pct/100), markers kept
+  batch_size: 4                # sequences per forward pass (run-probe, hf_local)
+  threshold_quantile: 0.95     # "not dependent" threshold: this quantile of the DEV null + within-flag drops
+  threshold_file: config/probe_threshold.yaml   # written by probe-threshold (with its sha256); test runs need it
+  bootstrap_resamples: 1000    # CIs, resampling admissions
+  # Physiologic plausibility bounds per checker lab group (MIMIC-IV default units); edited values are
+  # clamped into them and never below 0. A mapping uom -> [low, high] for groups reported in several units.
+  physiologic_bounds:
+    potassium: [1.0, 10.0]
+    sodium: [100, 185]
+    chloride: [60, 140]
+    bicarbonate: [3, 60]
+    creatinine: [0.1, 25]
+    urea nitrogen: [1, 250]
+    hemoglobin: [2, 25]
+    hematocrit: [6, 75]
+    white blood cells: [0.1, 300]
+    platelet: [1, 2000]
+    inr: [0.5, 20]
+    ptt: [15, 200]
+    glucose: [10, 2000]
+    magnesium: [0.3, 10]
+    calcium: {mg/dL: [3, 20], mmol/L: [0.4, 4]}
+    phosphate: [0.3, 20]
+    albumin: [0.5, 7]
+    ast: [1, 20000]
+    alt: [1, 20000]
+    alkaline phosphatase: [5, 5000]
+    bilirubin: [0.1, 60]
+    lactate: [0.2, 30]
+    troponin: [0, 100]
+    lipase: [1, 20000]
+    ph: [6.5, 8.0]
+    pco2: [5, 200]
+    po2: [10, 700]
+  # APPROXIMATE: drugs that can corroborate a lab-direction claim (substring of the drug name,
+  # case-insensitive), per checker lab group and direction. Hand-written, not exhaustive; used
+  # only to find units the corroborator ablation removes.
+  related_drugs:
+    potassium: {high: [sodium polystyrene, kayexalate, patiromer, zirconium], low: [potassium chloride, potassium phosphate, potassium bicarbonate, k-dur]}
+    sodium: {low: [tolvaptan, sodium chloride 3, salt tab], high: [free water]}
+    hemoglobin: {low: [ferrous, iron sucrose, epoetin, darbepoetin, red blood cells]}
+    hematocrit: {low: [ferrous, iron sucrose, epoetin, darbepoetin, red blood cells]}
+    glucose: {high: [insulin, glargine, lispro, aspart], low: [dextrose 50, glucagon]}
+    magnesium: {low: [magnesium sulfate, magnesium oxide]}
+    calcium: {low: [calcium gluconate, calcium carbonate, calcium chloride]}
+    phosphate: {low: [potassium phosphate, sodium phosphate, k-phos, neutra-phos], high: [sevelamer, calcium acetate, lanthanum]}
+    white blood cells: {low: [filgrastim]}
+    platelet: {low: [platelets]}
+    inr: {high: [phytonadione, vitamin k]}
+    bicarbonate: {low: [sodium bicarbonate]}
+    ph: {low: [sodium bicarbonate]}
+
 perturbation:
   n_targets: 15
   max_targets_per_admission: 2
