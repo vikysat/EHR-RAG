@@ -96,8 +96,9 @@ Every command that produces results writes `runs/<YYYYMMDD-HHMMSS-name>/`, conta
 | 14e | `run-probe --targets-run <id> [--resume <run id>] [--threshold-sha256 <sha>]` | GPU (`hf_local`, nohup) | teacher-forced log P(term) - log P(edit-consistent alternative), and the same for the number token, under each context; forward passes only, batched; `probe_scores.jsonl` written after every batch, `--resume` continues an interrupted run |
 | 14f | `probe-threshold --probe-run <dev id>` | CPU | "not dependent" threshold = `probe.threshold_quantile` of the DEV matched-null and within-flag drops, written to `probe.threshold_file` with its sha256 (test runs refuse a changed file) |
 | 14g | `analyze-probe --probe-run <id...> --evaluate-run <id> [--threshold-sha256 <sha>]` | CPU | per-unit dependence; share of NLI-supported claims below the threshold by order, corroboration and section, admission-bootstrap CIs: `probe_units_scored.csv`, `probe_summary.md/json` |
-| 16 | `make-tables [--evaluate-run] [--manual-labels] [--check-run] [--text-metrics-run] [--audit-run] [--probe-run]` | CPU | the paper's tables as markdown with 95% CIs: `tables.md`, `table_*.md` |
+| 16 | `make-tables [--evaluate-run <id...>] [--manual-labels] [--check-run] [--text-metrics-run] [--audit-run] [--probe-run]` | CPU | the paper's tables as markdown with 95% CIs: `tables.md`, `table_*.md` |
 | 15 | `notebooks/demo.ipynb` | any | one admission end to end from cached runs; no model calls |
+| 17 | `scripts/run_all.sh [--dry-run]` | GPU (nohup) | every remaining full-data step in order (checker freeze, enforced and drop-only test outputs, evaluation, checker statistics, text metrics, probe on dev and test, tables); re-runnable: skips finished steps, resumes run-probe, reuses the generation cache; RUNBOOK section 14 |
 
 `generate` and `run-pilot` print the number of calls and the estimated input tokens
 first. They require `--yes` when the new (uncached) calls exceed

@@ -231,8 +231,9 @@ def build_sequences(cfg: dict[str, Any], targets_dir: Path) -> tuple[list[dict[s
     return seqs, texts
 
 
-def load_scores(path: Path) -> dict[str, dict[str, Any]]:
-    """Scored sequences by key; a cut-off last line (interrupted write) is dropped from the file."""
+def load_scores(path: Path, repair: bool = True) -> dict[str, dict[str, Any]]:
+    """Scored sequences by key; a cut-off last line (interrupted write) is dropped from the file
+    (left in place with ``repair=False``)."""
     if not path.exists():
         return {}
     out: dict[str, dict[str, Any]] = {}
@@ -249,9 +250,25 @@ def load_scores(path: Path) -> dict[str, dict[str, Any]]:
             raise ProbeError(f"{path.name}: unreadable line {i + 1}")
         out[r["key"]] = r
         good.append(line)
-    if len(good) != sum(1 for x in lines if x.strip()):
+    if repair and len(good) != sum(1 for x in lines if x.strip()):
         path.write_text("".join(x + "\n" for x in good), encoding="utf-8", newline="\n")
     return out
+
+
+def probe_plan(cfg: dict[str, Any], targets_dir: Path, scores_path: Path | None,
+               log: Callable[[str], None] = print) -> dict[str, int]:
+    """``run-probe --plan-only``: the forward-pass plan, counting sequences already in ``scores_path``.
+    Reads only; ends with a ``PLAN {json}`` line."""
+    seqs, texts = build_sequences(cfg, targets_dir)
+    done = {k for k in load_scores(scores_path, repair=False) if k in texts} if scores_path else set()
+    bs = cfg["probe"]["batch_size"]
+    todo = len(texts) - len(done)
+    plan = {"units": len({s["probe_id"] for s in seqs}), "sequences": len(texts), "done": len(done), "todo": todo,
+            "batches": -(-todo // bs)}
+    log(f"== Probe plan: {plan['units']} units; expected forward passes: {plan['sequences']} distinct sequences "
+        f"({plan['done']} already scored, {todo} to run) in {plan['batches']} batches of <= {bs}")
+    log("PLAN " + json.dumps(plan, sort_keys=True))
+    return plan
 
 
 def run_probe(cfg: dict[str, Any], targets_dir: Path, run: Run, scorer: Scorer, *, resume: bool = False,

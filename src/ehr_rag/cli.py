@@ -510,6 +510,10 @@ def cmd_generate(args: argparse.Namespace) -> int:
     from ehr_rag.runs import check_frozen_checker
 
     check_frozen_checker(cfg, args.checker_sha256)
+    if args.plan_only:                     # no run folder, no model call
+        run_generation(cfg, None, make_backend(gen), hadm_ids=ids, conditions=conditions,  # type: ignore[arg-type]
+                       retrieval_run=args.retrieval_run, no_cache=args.no_cache, plan_only=True)
+        return 0
     run = start_run(cfg, "generate", command="generate", run_id=args.run_id)
     run.meta.update(backend=gen["backend"], model=gen["model"], conditions=conditions, hadm_ids=ids,
                     retrieval_run=args.retrieval_run, prompt_version=gen["prompt_version"],
@@ -1006,6 +1010,16 @@ def cmd_run_probe(args: argparse.Namespace) -> int:
     except score.ProbeError as e:
         print(f"STOP - {e}", file=sys.stderr)
         return 4
+    if args.plan_only:                     # no run folder, no model
+        from ehr_rag.probe.runner import SCORES_FILE, probe_plan
+
+        done = project_root(cfg) / "runs" / args.resume / SCORES_FILE if args.resume else None
+        try:
+            probe_plan(cfg, tdir, done)
+        except score.ProbeError as e:
+            print(f"STOP - {e}", file=sys.stderr)
+            return 4
+        return 0
     if args.resume:
         path = project_root(cfg) / "runs" / args.resume
         meta = _read_json(path / "run_meta.json") if (path / "run_meta.json").exists() else {}
@@ -1129,7 +1143,9 @@ def cmd_make_tables(args: argparse.Namespace) -> int:
 
     cfg = load_config(args.config)
     dirs = {k: (_run_dir(cfg, getattr(args, k), k) if getattr(args, k) else None)
-            for k in ("evaluate_run", "check_run", "text_metrics_run", "audit_run", "probe_run")}
+            for k in ("check_run", "text_metrics_run", "audit_run", "probe_run")}
+    eval_dirs = [_run_dir(cfg, e, "evaluate") for e in (args.evaluate_run or [])]
+    dirs = {"evaluate_run": eval_dirs or None, **dirs}
     if not any(dirs.values()):
         raise ConfigError("give at least one of --evaluate-run, --check-run, --text-metrics-run, --audit-run, "
                           "--probe-run")
@@ -1141,7 +1157,8 @@ def cmd_make_tables(args: argparse.Namespace) -> int:
     for name, k in counts.items():
         print(f"table {name}: {k} rows")
     print(f"wrote tables.md and table_*.md to {run.path}")
-    run.finish(sources={k: (v.name if v else None) for k, v in dirs.items()}, manual_labels=args.manual_labels,
+    run.finish(sources={k: ([x.name for x in v] if isinstance(v, list) else v.name if v else None)
+                        for k, v in dirs.items()}, manual_labels=args.manual_labels,
                rows=counts)
     return 0
 
@@ -1287,6 +1304,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="admissions per shard (with --shard-index; scripts/generate_array.sbatch sets both)")
     p.add_argument("--shard-index", type=int, help="0-based shard to generate (contiguous blocks of --shard-size)")
     p.add_argument("--checker-sha256", help="refuse to run unless the checker files' combined sha256 equals this")
+    p.add_argument("--plan-only", action="store_true",
+                   help="print the call plan (and a PLAN json line) and exit: no run folder, no model call")
     p = add("check-citations", cmd_check_citations,
             "Deterministic citation-checker statistics (error profile, coverage, enforcement) for generation runs.")
     p.add_argument("--generation-run", required=True, nargs="+", help="run id(s) of `generate` / `enforce-filter` runs")
@@ -1355,6 +1374,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     g.add_argument("--resume", help="run id of an interrupted run-probe run to continue")
     p.add_argument("--threshold-sha256", help="required on the test split: the sha256 printed by probe-threshold")
+    p.add_argument("--plan-only", action="store_true",
+                   help="print the forward-pass plan (and a PLAN json line) and exit; with --resume, count what "
+                        "that run already scored")
     p = add("probe-threshold", cmd_probe_threshold,
             "Citation-dependence probe: write the 'not dependent' threshold (DEV matched-null and within-flag "
             "drops) to probe.threshold_file with its sha256.")
@@ -1369,7 +1391,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("make-tables", cmd_make_tables,
             "Markdown tables (support, audit, enforcement, checker profile, reference metrics, probe) with 95%% CIs.")
-    p.add_argument("--evaluate-run", help="run id of an `evaluate` run (table 1)")
+    p.add_argument("--evaluate-run", nargs="+",
+                   help="run id(s) of `evaluate` runs (table 1); several are merged, e.g. base + enforced/filtered")
     p.add_argument("--manual-labels", help="labeled manual_review.csv (table 1, manual unsupported)")
     p.add_argument("--check-run", help="run id of a `check-citations` run (tables 3 and 4)")
     p.add_argument("--text-metrics-run", help="run id of a `text-metrics` run (table 5)")

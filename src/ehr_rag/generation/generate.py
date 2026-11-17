@@ -339,6 +339,30 @@ class Generator:
         return status
 
 
+def enforced_plan(jobs: list[Job], enforced: list[str], g: "Generator", templates: PromptTemplates,
+                  checker: Any, units_by_h: dict[int, list[EvidenceUnit]]) -> dict[str, int]:
+    """Base reports cached and the rewrite-call bound for the enforced jobs (see ``run_generation``)."""
+    from ehr_rag.eval.parse import parse_report
+
+    n_base = n_cached = n_fail = 0
+    for job in jobs:
+        if job.condition not in enforced:
+            continue
+        n_base += 1
+        c = g.cache.get(g.key(job.prompt))
+        if c is None:
+            continue
+        n_cached += 1
+        text = c.text
+        _, problems = check_format(text)
+        if problems:
+            c2 = g.cache.get(g.key(with_format_reminder(templates, job.prompt, problems[:MAX_PROBLEMS_IN_REMINDER])))
+            text = c2.text if c2 is not None else text
+        ctx = checker.admission(job.evidence, units_by_h[job.hadm_id])
+        n_fail += sum(1 for lc in checker.check_report(parse_report(text), ctx) if lc.status == "fail")
+    return {"base_reports": n_base, "base_cached": n_cached, "rewrite_max": n_fail}
+
+
 def run_generation(
     cfg: dict[str, Any],
     run: Run,
@@ -350,11 +374,17 @@ def run_generation(
     yes: bool = False,
     no_cache: bool = False,
     log: Callable[[str], None] = print,
+    plan_only: bool = False,
 ) -> dict[str, Any]:
     """Plan, confirm and run generation. Returns a summary (counts per condition etc.).
 
     Raises ConfirmationRequired before any call if new calls exceed the threshold
     without ``yes``; any backend failure propagates and stops the run.
+
+    ``plan_only``: print the plan and return ``{"plan": ...}`` without any call or file (``run`` may be
+    None). The plan adds, for enforced conditions, how many base reports are already cached and at most
+    how many rewrite calls they need (failing lines of the cached base reports, after the format retry
+    if that is cached too).
     """
     gen = cfg["generation"]
     root = project_root(cfg)
@@ -402,6 +432,14 @@ def run_generation(
         f"{sum(j.input_tokens for j in jobs):,} ({'exact, model tokenizer' if exact else 'approximate, chars/4'}); "
         "format retries (at most one per call) not included"
         + ("; enforced conditions add at most one rewrite call per failing sentence" if enforced else ""))
+    if plan_only:
+        plan: dict[str, Any] = {"calls": len(jobs), "cached": n_cached, "new": n_new}
+        if enforced:
+            plan.update(enforced_plan(jobs, enforced, g, templates, checker, units_by_h))
+            log(f"  enforced: {plan['base_cached']}/{plan['base_reports']} base reports cached; rewrite calls at most "
+                f"{plan['rewrite_max']} (failing lines of the cached base reports)")
+        log("PLAN " + json.dumps(plan, sort_keys=True))
+        return {"plan": plan}
     run.write_json("skipped.json", skipped)
     if n_new > gen["confirm_threshold"] and not yes:
         raise ConfirmationRequired(

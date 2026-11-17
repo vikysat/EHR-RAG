@@ -576,3 +576,35 @@ python -m ehr_rag.cli make-tables --config config/full.yaml --evaluate-run <EVAL
     --text-metrics-run <TM_TEST> --audit-run <AUDIT_TEST> --probe-run <PROBE_TEST>
 ```
 Table 6 (`table_6_probe.md`) is the probe; stdout shows counts and shares only.
+
+---
+
+## 14. Everything remaining in one go: `scripts/run_all.sh` (GPU machine, nohup)
+
+Runs steps 1-9 in order from the fixed inputs (dev generation `20261116-193521-generate`, dev evaluation
+`20261117-152134-evaluate`, test retrieval `20261117-011229-retrieve`, test generation
+`20261117-011443-generate`, test evaluation `20261117-152041-evaluate`): freeze the checker + dev
+check-citations; enforced test generation (base reports from the cache); enforce-filter; evaluate the
+enforced and drop-only outputs; check-citations on test; text-metrics; probe on dev (with the threshold);
+probe on test; make-tables. Step list and rules: `src/ehr_rag/run_all.py`.
+
+```bash
+cd ~/EHR-RAG          # the repository on the GPU machine
+scripts/run_all.sh --dry-run                     # the plan: per step skip / resume / start, no command runs
+nohup scripts/run_all.sh > /dev/null 2>&1 &      # run
+tail -f ~/scratch/logs/run_all.log               # STEP n done markers, expected calls before steps 2, 7, 8
+```
+When the session ends (~5 h), start the same `nohup` line again: finished steps are skipped (after checking
+they were made with the same arguments), `run-probe` continues with `--resume`, an unfinished generation
+starts again and takes every finished call from the response cache. The first error stops the script
+(`STOP - ...` and `exit status 1` at the end of the log); fix the cause and start it again.
+
+- `~/scratch/logs/run_all_ids.txt`: every run id created (`key<TAB>run id<TAB>time`, last line per key wins),
+  the frozen checker hash (`checker_sha256`) and the probe threshold hash (`probe_threshold_sha256`). To
+  redo a finished step, delete its line(s).
+- The checker is frozen by its recorded hash: if `config/checker.yaml`, the lexicon or the rewrite prompt
+  change afterwards, the script stops. Nothing is committed or pushed; `config/probe_threshold.yaml` stays
+  local until you commit it.
+- Step 2 stops before any call if the base test reports are not all in `cache/generation/`.
+- Text-metrics references default to `data/cohort/reference/references.csv` (`--references` to change).
+- A second copy started while one is running exits at once (`flock`).

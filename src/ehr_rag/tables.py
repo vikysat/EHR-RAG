@@ -66,8 +66,23 @@ def _md(header: list[str], rows: list[list[str]]) -> list[str]:
 # --------------------------------------------------------------------------- table 1: support
 
 
-def table_support(eval_dir: Path, manual: Path | None, n: int, seed: int) -> tuple[list[str], int]:
-    sents = [s for s in _read_jsonl(eval_dir / "sentences.jsonl") if not s["is_abstention"]]
+def _merged_sentences(eval_dirs: list[Path]) -> list[dict[str, Any]]:
+    """sentences.jsonl of several evaluate runs; a (condition, admission) in two runs is an error."""
+    out: list[dict[str, Any]] = []
+    owner: dict[tuple[str, int], str] = {}
+    for d in eval_dirs:
+        rows = _read_jsonl(d / "sentences.jsonl")
+        for key in {(s["condition"], int(s["hadm_id"])) for s in rows}:
+            if key in owner:
+                raise ValueError(f"condition {key[0]} of one admission is in both {owner[key]} and {d.name}")
+            owner[key] = d.name
+        out.extend(rows)
+    return out
+
+
+def table_support(eval_dir: Path | list[Path], manual: Path | None, n: int, seed: int) -> tuple[list[str], int]:
+    dirs = eval_dir if isinstance(eval_dir, list) else [eval_dir]
+    sents = [s for s in _merged_sentences(dirs) if not s["is_abstention"]]
     labels = []
     if manual is not None:
         labels = [r for r in _read_csv(manual) if r.get("human_support") and r["human_support"] != "not_checkable"]
@@ -198,7 +213,7 @@ def table_probe(probe_dir: Path) -> tuple[list[str], int]:
     return lines + _md(header, rows), len(rows)
 
 
-def make_tables(out_dir: Path, *, eval_dir: Path | None, manual: Path | None, check_dir: Path | None,
+def make_tables(out_dir: Path, *, eval_dir: Path | list[Path] | None, manual: Path | None, check_dir: Path | None,
                 tm_dir: Path | None, audit_dir: Path | None, n: int, seed: int,
                 probe_dir: Path | None = None) -> dict[str, int]:
     """Write ``table_<k>_<name>.md`` per available source and ``tables.md``; returns rows per table."""
@@ -217,7 +232,10 @@ def make_tables(out_dir: Path, *, eval_dir: Path | None, manual: Path | None, ch
     sources = {"evaluate": eval_dir, "manual labels": manual, "check-citations": check_dir,
                "text-metrics": tm_dir, "analyze-audit": audit_dir,
                "analyze-probe": probe_dir}
-    doc = ["# Tables", "", "Sources: " + "; ".join(f"{k} `{v.name}`" for k, v in sources.items() if v), ""]
+    def names(v: Any) -> str:
+        return ", ".join(f"`{x.name}`" for x in v) if isinstance(v, list) else f"`{v.name}`"
+
+    doc = ["# Tables", "", "Sources: " + "; ".join(f"{k} {names(v)}" for k, v in sources.items() if v), ""]
     counts = {}
     for name, (lines, n_rows) in parts:
         (out_dir / f"table_{name}.md").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
