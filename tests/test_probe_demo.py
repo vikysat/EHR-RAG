@@ -22,13 +22,21 @@ BAND_POINTS = ("first", "max", "min", "last")
 
 
 def _responder(prompt: str, n: int) -> str:
-    """Restates the evidence (``realistic_report``) with a direction word on every lab line."""
+    """Restates the evidence (``realistic_report``) with a direction word on every lab line; every other
+    lab line is first restated plainly (no direction word), so that unit's prefix names its lab and value."""
     from fakes import realistic_report
 
     rep = realistic_report(prompt)
     out = []
+    k = 0
     for line in rep.splitlines():
-        out.append(f"Elevated {line[0].lower()}{line[1:]}" if " reached " in line else line)
+        if " reached " in line:
+            if k % 2 == 0:
+                out.append(line)
+            out.append(f"Elevated {line[0].lower()}{line[1:]}")
+            k += 1
+        else:
+            out.append(line)
     return "\n".join(out) + "\n"
 
 
@@ -76,6 +84,29 @@ def test_probe_on_demo_units(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ca
                     assert _side(f1, p) == _side(f0, p) and v != Decimal(f0[p]["value"])
     with (tdir / "probe_skips.csv").open(encoding="utf-8") as f:
         assert all(r["reason"] for r in csv.DictReader(f))
+    # prefix check: every unit has the context; prefix edits replace a stated value of the cited unit (by an
+    # edited value of that unit) or a direction word, and lie wholly before the term
+    by_pid = {u["probe_id"]: u for u in units}
+    pre = {c["probe_id"]: c for c in ctxs if c["context"] == "cited_edit_prefix"}
+    assert set(pre) == set(by_pid)
+    words = {w.lower() for ws in ck.dir_words for w in ccfg_words(ccfg, ws)}
+    for pid, c in pre.items():
+        u = by_pid[pid]
+        assert c["replace"] == next(x for x in ctxs if x["probe_id"] == pid and x["context"] == "cited_edit")["replace"]
+        n_val = int(u["prefix_values"])
+        assert u["prefix_mentions_lab"] == str(bool(int(u["prefix_lab_names"]) or n_val))
+        assert len(c["prefix_edits"]) == n_val + int(u["prefix_flips"])
+        d = root / "runs" / proj["gen"] / "ehr_rag" / u["hadm_id"]
+        raw = (d / json.loads((d / "parsed.json").read_text(encoding="utf-8"))["raw_file"]).read_text(encoding="utf-8")
+        orig = {Decimal(f["value"]) for f in (c["replace"][0]["original_fields"][p] for p in BAND_POINTS)}
+        new = {Decimal(f["value"]) for f in (c["replace"][0]["edited_fields"][p] for p in BAND_POINTS)}
+        for a, b, rep in c["prefix_edits"]:
+            assert b <= int(u["term_cut"])
+            old = raw[a:b]
+            if old[:1].isdigit():
+                assert ck.number_matches(Decimal(old), list(orig)) and ck.number_matches(Decimal(rep), list(new))
+            else:
+                assert old.lower() in words
 
     monkeypatch.setattr(score, "make_scorer", lambda g: FakeScorer())
     assert main(["run-probe", "--config", cfg, "--targets-run", tdir.name, "--run-id", "20990101-000001-run-probe"]) == 0
@@ -86,3 +117,19 @@ def test_probe_on_demo_units(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ca
                  "--evaluate-run", erun.run_id, "--run-id", "20990101-000002-analyze-probe"]) == 0
     s = json.loads((root / "runs" / "20990101-000002-analyze-probe" / "probe_summary.json").read_text(encoding="utf-8"))
     assert s["n_scored"] == len(units) and s["splits"]["all"]["share"]["n_resamples"] in (0, 1000)
+    n_yes = sum(u["prefix_mentions_lab"] == "True" for u in units)
+    assert 0 < n_yes < len(units) and sum(len(c["prefix_edits"]) for c in pre.values()) > 0    # not vacuous
+    pf = s["prefix"]
+    assert pf["n_supported_with_prefix_flag"] == s["n_supported"]
+    assert sum(pf["by_prefix_mentions_lab"][f"prefix_mentions_lab={v}"]["n_units"] for v in ("yes", "no")) == \
+        s["n_supported"]
+    assert pf["dependence_prefix"]["all"]["n_units"] == s["n_supported"]
+
+
+def ccfg_words(cfg: dict[str, Any], direction: str) -> list[str]:
+    """Direction words of the checker rules (high / low / normal)."""
+    import yaml
+
+    from ehr_rag.checker.rules import checker_paths
+
+    return [str(w) for w in yaml.safe_load(checker_paths(cfg)["rules"].read_text(encoding="utf-8"))["direction"][direction]]
