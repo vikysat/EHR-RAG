@@ -85,7 +85,7 @@ def test_contexts_null_and_corroborators() -> None:
     assert na.corroborators == [] and "ablation" not in na.contexts
     assert k.null_unit in {"E3", "E10"}                                      # uncited, also HIGH
     assert na.null_unit == "E7"                                              # the only uncited LOW lab
-    assert k.contexts == ["original", "cited_edit", "within_flag", "matched_null", "ablation"]
+    assert k.contexts == ["original", "cited_edit", "cited_edit_prefix", "within_flag", "matched_null", "ablation"]
     ev = apply_spec(units, rp.specs[(0, "cited_edit")])
     e1 = next(u for u in ev if u.unit_id == "E1")
     assert "[HIGH]" not in e1.text and e1.text == render("lab", e1.fields)
@@ -237,13 +237,13 @@ def probe_env(env: dict[str, Any], capsys: pytest.CaptureFixture) -> dict[str, A
 
 def test_probe_targets_cli(probe_env: dict[str, Any]) -> None:
     out = probe_env["targets_out"]
-    assert "split: demo" in out and "units: 2" in out and "expected forward passes: 30" in out
+    assert "split: demo" in out and "units: 2" in out and "expected forward passes: 34" in out
     t = probe_env["root"] / "runs" / "20990101-000000-probe-targets"
     with (t / "probe_units.csv").open(encoding="utf-8") as f:
         units = list(csv.DictReader(f))
     assert [(u["hadm_id"], u["surface"], u["term_alt"], u["contexts"]) for u in units] == [
-        ("12", "Elevated", "Normal", "original cited_edit within_flag"),
-        ("21", "Elevated", "Normal", "original cited_edit within_flag")]
+        ("12", "Elevated", "Normal", "original cited_edit cited_edit_prefix within_flag"),
+        ("21", "Elevated", "Normal", "original cited_edit cited_edit_prefix within_flag")]
     assert "Fakeium" not in out
 
 
@@ -258,7 +258,7 @@ def test_run_probe_resumes_after_an_interruption(probe_env: dict[str, Any], monk
         main(["run-probe", "--config", cfg, "--targets-run", "20990101-000000-probe-targets",
               "--run-id", "20990101-000001-run-probe"])
     run = probe_env["root"] / "runs" / "20990101-000001-run-probe"
-    assert "expected forward passes: 30 distinct sequences (0 already scored, 30 to run) in 8 batches" in \
+    assert "expected forward passes: 30 to run of 30 distinct sequences (0 already scored or reused, 0 of them reused now) in 8 batches" in \
         capsys.readouterr().out
     lines = (run / "probe_scores.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 8 and json.loads((run / "run_meta.json").read_text(encoding="utf-8"))["status"] == "interrupted"
@@ -271,7 +271,7 @@ def test_run_probe_resumes_after_an_interruption(probe_env: dict[str, Any], monk
     assert main(["run-probe", "--config", cfg, "--targets-run", "20990101-000000-probe-targets",
                  "--resume", run.name]) == 0
     out = capsys.readouterr().out
-    assert "(8 already scored, 22 to run)" in out
+    assert "22 to run of 30 distinct sequences (8 already scored or reused" in out
     rows = [json.loads(x) for x in (run / "probe_scores.jsonl").read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 30 and len({r["key"] for r in rows}) == 30
     meta = json.loads((run / "run_meta.json").read_text(encoding="utf-8"))

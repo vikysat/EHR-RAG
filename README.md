@@ -92,10 +92,10 @@ Every command that produces results writes `runs/<YYYYMMDD-HHMMSS-name>/`, conta
 | 14a | `audit-targets --generation-run <id...>` | CPU | counterfactual audit targets: per admission up to 3 cited labs (flagged first) + 1 uncited null-edit lab; edits to the other side of the reference range: `audit_targets.csv`, `audit_edits.jsonl`, `audit_skips.csv` |
 | 14b | `run-audit --targets-run <id>` | GPU (`scripts/audit_array.sbatch`) | regenerations with the edited unit in the frozen evidence, for `ehr_rag` and `ehr_rag_enforced` (frozen checker + rewrite); shardable over admissions |
 | 14c | `analyze-audit --audit-run <id...>` | CPU | Follows / Stale / Dropped / Other per (original claim, edited unit); faithfulness with 95% bootstrap CIs (paired plain vs enforced); term survival; null-edit churn; `audit_manual_check.csv` (50 pairs) |
-| 14d | `probe-targets --generation-run <id...>` | CPU | citation-dependence probe units (first lab-direction claim per lab group in each plain ehr_rag report that cites the matching lab) and their contexts: original, cited edit, within-flag edit, matched null, corroborator ablation; prints the expected forward passes: `probe_units.csv`, `probe_contexts.jsonl`, `probe_skips.csv` |
-| 14e | `run-probe --targets-run <id> [--resume <run id>] [--threshold-sha256 <sha>]` | GPU (`hf_local`, nohup) | teacher-forced log P(term) - log P(edit-consistent alternative), and the same for the number token, under each context; forward passes only, batched; `probe_scores.jsonl` written after every batch, `--resume` continues an interrupted run |
+| 14d | `probe-targets --generation-run <id...>` | CPU | citation-dependence probe units (first lab-direction claim per lab group in each plain ehr_rag report that cites the matching lab) and their contexts: original, cited edit, cited edit + prefix, within-flag edit, matched null, corroborator ablation; prints the expected forward passes: `probe_units.csv`, `probe_contexts.jsonl`, `probe_skips.csv` |
+| 14e | `run-probe --targets-run <id> [--resume <run id>] [--reuse-scores <run id...>] [--threshold-sha256 <sha>] [--plan-only]` | GPU (`hf_local`, nohup) | teacher-forced log P(term) - log P(edit-consistent alternative), and the same for the number token, under each context; forward passes only, batched; `probe_scores.jsonl` written after every batch, `--resume` continues an interrupted run; `--reuse-scores` copies sequences scored by earlier runs (same model and revision) so only new ones are scored |
 | 14f | `probe-threshold --probe-run <dev id>` | CPU | "not dependent" threshold = `probe.threshold_quantile` of the DEV matched-null and within-flag drops, written to `probe.threshold_file` with its sha256 (test runs refuse a changed file) |
-| 14g | `analyze-probe --probe-run <id...> --evaluate-run <id> [--threshold-sha256 <sha>]` | CPU | per-unit dependence; share of NLI-supported claims below the threshold by order, corroboration and section, admission-bootstrap CIs: `probe_units_scored.csv`, `probe_summary.md/json` |
+| 14g | `analyze-probe --probe-run <id...> --evaluate-run <id> [--threshold-sha256 <sha>]` | CPU | per-unit dependence; share of NLI-supported claims below the threshold by order, corroboration, section and section x prefix_mentions_lab, and using dependence_prefix, admission-bootstrap CIs: `probe_units_scored.csv`, `probe_summary.md/json` |
 | 16 | `make-tables [--evaluate-run <id...>] [--manual-labels] [--check-run] [--text-metrics-run] [--audit-run] [--probe-run]` | CPU | the paper's tables as markdown with 95% CIs: `tables.md`, `table_*.md` |
 | 15 | `notebooks/demo.ipynb` | any | one admission end to end from cached runs; no model calls |
 | 17 | `scripts/run_all.sh [--dry-run]` | GPU (nohup) | every remaining full-data step in order (checker freeze, enforced and drop-only test outputs, evaluation, checker statistics, text metrics, probe on dev and test, tables); re-runnable: skips finished steps, resumes run-probe, reuses the generation cache; RUNBOOK section 14 |
@@ -322,17 +322,27 @@ only; no generation, only forward passes with the original report teacher-forced
   of a shown lab cited nowhere in the report, with the cited unit's status); corroborator ablation
   (other shown labs of the group, diagnosis titles containing a matching lexicon term, drugs in the
   APPROXIMATE `probe.related_drugs`). Edited values are clamped to `probe.physiologic_bounds`
-  (never below 0).
+  (never below 0). Cited edit + prefix: the cited edit plus the same edit in the forced report
+  prefix (the cited lab's original values replaced by the edited ones, that lab's direction words
+  flipped; term only).
+- **Prefix check**: `prefix_mentions_lab` = the forced report prefix (text before the term, not the
+  prompt) names the cited lab (checker names and abbreviations) or states one of its values in a
+  claim that names or cites it.
 - **Score**: s = log P(term) - log P(alternative) at the term's position, each the sum over the
   continuation's tokens; the alternative is consistent with the cited edit (`normal`, `elevated`,
-  `low`; for terms `normal <lab>` or the opposite term). Dependence = s(original) - s(cited edit).
+  `low`; for terms `normal <lab>` or the opposite term). Dependence = s(original) - s(cited edit);
+  dependence_prefix = s(original) - s(cited edit + prefix).
   Number token: alternative = the edited value (positive control).
 - **Threshold**: the 0.95 quantile of the DEV null and within-flag drops, written once to
   `config/probe_threshold.yaml` with a sha256; test runs need `--threshold-sha256` and refuse a
   changed file. **Headline**: among claims the NLI judged supported, the share with dependence
-  below the threshold, by order, corroboration and section; 1,000 admission-bootstrap resamples.
+  below the threshold, by order, corroboration and section, and by section x prefix_mentions_lab;
+  the same share using dependence_prefix; 1,000 admission-bootstrap resamples.
 - Forward passes = sequences: per unit and context 2 for the term, plus 3 for a number (original,
-  cited-edit value, within-flag value). Commands: RUNBOOK section 13.
+  cited-edit value, within-flag value); the cited-edit + prefix context adds new passes only where
+  the prefix has something to edit. `run-probe --reuse-scores <earlier run-probe run>` copies
+  every sequence already scored with the same model and revision, so a new run scores only what is
+  new. Commands: RUNBOOK sections 13 and 13.3.
 
 ## Known limitations
 

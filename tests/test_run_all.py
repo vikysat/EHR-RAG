@@ -267,7 +267,7 @@ def test_run_probe_plan_only(probe_env: dict[str, Any], monkeypatch: pytest.Monk
     capsys.readouterr()
     before = set((probe_env["root"] / "runs").iterdir())
     assert main(["run-probe", "--config", cfg, "--targets-run", "20990101-000000-probe-targets", "--plan-only"]) == 0
-    assert parse_plan(capsys.readouterr().out) == {"units": 2, "sequences": 30, "done": 0, "todo": 30, "batches": 8}
+    assert parse_plan(capsys.readouterr().out) == {"units": 2, "sequences": 30, "done": 0, "reused": 0, "todo": 30, "batches": 8}
     assert set((probe_env["root"] / "runs").iterdir()) == before
     monkeypatch.setattr(score, "make_scorer", lambda g: FakeScorer(fail_after=2))
     with pytest.raises(KeyboardInterrupt):

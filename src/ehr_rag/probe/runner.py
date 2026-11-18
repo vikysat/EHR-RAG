@@ -9,12 +9,19 @@ split are accepted only with ``data.source: demo`` (split ``demo``).
 
 Sequences (one forward pass each): per unit and context, the original term and its alternative,
 forced up to ``term_cut``; if the claim has a number, the original number, the cited-edit value and
-the within-flag value, forced up to ``number_cut``. Identical sequences are scored once.
+the within-flag value, forced up to ``number_cut``. In ``cited_edit_prefix`` the forced prefix carries
+the context's prefix edits and only the term continuations are scored. Identical sequences are scored
+once (so a unit whose prefix has nothing to edit costs no extra pass).
 
 ``run-probe`` appends one JSON line per scored sequence to ``probe_scores.jsonl`` after every batch
 (flushed and fsynced). Re-running with ``--resume <run id>`` reopens that run, checks that the plan
 (every sequence key, the targets run, the model and its revision) is unchanged, and scores only the
 sequences not yet in the file (a cut-off last line is discarded).
+
+Reuse: ``--reuse-scores <run-probe run> ...`` copies every scored sequence of earlier run-probe runs
+whose key is in this plan (same prompt, prefix and continuation, hence the same forward pass) into
+this run's file before scoring, after checking the earlier runs used the same model and revision.
+Only what is new is scored; copied lines carry ``reused_from``.
 
 Threshold guard: on a test-split targets run, ``run-probe`` (and ``analyze-probe``) refuse to run unless
 ``probe.threshold_file`` exists, its stored sha256 matches its content, and equals ``--threshold-sha256``.
@@ -37,7 +44,7 @@ from ehr_rag.generation.generate import MAX_PROBLEMS_IN_REMINDER, _write_json
 from ehr_rag.generation.prompt import build_prompt, load_templates, with_format_reminder
 from ehr_rag.perturb.run_pilot import _read_json, _write_csv, cited_claim_counts, ehr_rag_reports, frozen_units
 from ehr_rag.probe.score import ProbeError, Scorer
-from ehr_rag.probe.targets import UNIT_COLUMNS, apply_spec, probe_report
+from ehr_rag.probe.targets import TERM_ONLY_CONTEXTS, UNIT_COLUMNS, apply_prefix_edits, apply_spec, probe_report
 from ehr_rag.runs import Run
 
 SCORES_FILE = "probe_scores.jsonl"
@@ -223,10 +230,14 @@ def build_sequences(cfg: dict[str, Any], targets_dir: Path) -> tuple[list[dict[s
             if u["number_alt_within"]:
                 conts.append(("num_alt_within", nc, raw[nc:ns] + u["number_alt_within"]))
         for c in u["contexts"].split():
-            prompt = prompt_for(apply_spec(base, specs[(u["probe_id"], c)]))
+            spec = specs[(u["probe_id"], c)]
+            prompt = prompt_for(apply_spec(base, spec))
             for role, cut, cont in conts:
-                k = seq_key(prompt, raw[:cut], cont)
-                texts[k] = (prompt, raw[:cut], cont)
+                if c in TERM_ONLY_CONTEXTS and not role.startswith("term_"):
+                    continue
+                prefix = apply_prefix_edits(raw[:cut], spec.get("prefix_edits", []))
+                k = seq_key(prompt, prefix, cont)
+                texts[k] = (prompt, prefix, cont)
                 seqs.append({"key": k, "probe_id": u["probe_id"], "hadm_id": h, "context": c, "role": role})
     return seqs, texts
 
@@ -255,24 +266,43 @@ def load_scores(path: Path, repair: bool = True) -> dict[str, dict[str, Any]]:
     return out
 
 
+def reusable_scores(reuse_dirs: list[Path], keys: set[str], model: str | None = None,
+                    revision: str | None = None) -> dict[str, dict[str, Any]]:
+    """Scored sequences of earlier run-probe runs whose key is in ``keys`` (first run wins). With
+    ``model`` given, refuses runs scored with another model or revision."""
+    out: dict[str, dict[str, Any]] = {}
+    for d in reuse_dirs:
+        if model is not None:
+            old = _read_json(d / PLAN_FILE) if (d / PLAN_FILE).exists() else {}
+            if (old.get("model"), old.get("revision")) != (model, revision):
+                raise ProbeError(f"--reuse-scores {d.name}: scored with model {old.get('model')} revision "
+                                 f"{old.get('revision')}, not {model} {revision}; refusing to mix scores")
+        for k, r in load_scores(d / SCORES_FILE, repair=False).items():
+            if k in keys and k not in out:
+                out[k] = {**r, "reused_from": r.get("reused_from") or d.name}
+    return out
+
+
 def probe_plan(cfg: dict[str, Any], targets_dir: Path, scores_path: Path | None,
-               log: Callable[[str], None] = print) -> dict[str, int]:
-    """``run-probe --plan-only``: the forward-pass plan, counting sequences already in ``scores_path``.
-    Reads only; ends with a ``PLAN {json}`` line."""
+               log: Callable[[str], None] = print, reuse_dirs: list[Path] | None = None) -> dict[str, int]:
+    """``run-probe --plan-only``: the forward-pass plan, counting sequences already in ``scores_path``
+    and those reusable from ``reuse_dirs``. Reads only; ends with a ``PLAN {json}`` line."""
     seqs, texts = build_sequences(cfg, targets_dir)
     done = {k for k in load_scores(scores_path, repair=False) if k in texts} if scores_path else set()
+    reused = set(reusable_scores(reuse_dirs or [], set(texts))) - done
     bs = cfg["probe"]["batch_size"]
-    todo = len(texts) - len(done)
-    plan = {"units": len({s["probe_id"] for s in seqs}), "sequences": len(texts), "done": len(done), "todo": todo,
-            "batches": -(-todo // bs)}
-    log(f"== Probe plan: {plan['units']} units; expected forward passes: {plan['sequences']} distinct sequences "
-        f"({plan['done']} already scored, {todo} to run) in {plan['batches']} batches of <= {bs}")
+    todo = len(texts) - len(done) - len(reused)
+    plan = {"units": len({s["probe_id"] for s in seqs}), "sequences": len(texts), "done": len(done),
+            "reused": len(reused), "todo": todo, "batches": -(-todo // bs)}
+    log(f"== Probe plan: {plan['units']} units; {plan['sequences']} distinct sequences ({plan['done']} already "
+        f"scored, {plan['reused']} reused from earlier runs); expected forward passes: {todo} in "
+        f"{plan['batches']} batches of <= {bs}")
     log("PLAN " + json.dumps(plan, sort_keys=True))
     return plan
 
 
 def run_probe(cfg: dict[str, Any], targets_dir: Path, run: Run, scorer: Scorer, *, resume: bool = False,
-              log: Callable[[str], None] = print) -> dict[str, Any]:
+              log: Callable[[str], None] = print, reuse_dirs: list[Path] | None = None) -> dict[str, Any]:
     """Score every sequence not yet in ``probe_scores.jsonl``, printing the expected forward passes first."""
     seqs, texts = build_sequences(cfg, targets_dir)
     if not seqs:
@@ -293,16 +323,30 @@ def run_probe(cfg: dict[str, Any], targets_dir: Path, run: Run, scorer: Scorer, 
     stray = [k for k in done if k not in texts]
     if stray:
         raise ProbeError(f"{len(stray)} scored sequences are not in the plan; refusing to mix runs")
+    first = {}
+    for s in seqs:
+        first.setdefault(s["key"], s)
+    reused = {k: r for k, r in reusable_scores(reuse_dirs or [], set(texts), plan["model"],
+                                               plan["revision"]).items() if k not in done}
+    if reused:
+        with path.open("a", encoding="utf-8", newline="\n") as f:
+            for k in sorted(reused):
+                s, r = first[k], reused[k]
+                f.write(json.dumps({"key": k, "probe_id": s["probe_id"], "hadm_id": s["hadm_id"],
+                                    "context": s["context"], "role": s["role"], "tokens": r["tokens"],
+                                    "logprobs": r["logprobs"], "boundary_merge": r["boundary_merge"],
+                                    "reused_from": r["reused_from"]}) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        log(f"  reused {len(reused)} scored sequences from {', '.join(d.name for d in reuse_dirs or [])}")
+        done.update(reused)
     todo = [k for k in keys if k not in done]
     bs = cfg["probe"]["batch_size"]
     n_units = len({s["probe_id"] for s in seqs})
     log(f"== Probe plan: {n_units} units, {len({(s['probe_id'], s['context']) for s in seqs})} (unit, context) "
         f"pairs, {len(seqs)} scored continuations")
-    log(f"  expected forward passes: {len(keys)} distinct sequences ({len(done)} already scored, {len(todo)} to run) "
-        f"in {-(-len(todo) // bs)} batches of <= {bs}")
-    first = {}
-    for s in seqs:
-        first.setdefault(s["key"], s)
+    log(f"  expected forward passes: {len(todo)} to run of {len(keys)} distinct sequences ({len(done)} already "
+        f"scored or reused, {len(reused)} of them reused now) in {-(-len(todo) // bs)} batches of <= {bs}")
     todo.sort(key=lambda k: -(len(texts[k][0]) + len(texts[k][1])))      # longest first: OOM shows up early
     n_merge = 0
     with path.open("a", encoding="utf-8", newline="\n") as f:
@@ -319,4 +363,5 @@ def run_probe(cfg: dict[str, Any], targets_dir: Path, run: Run, scorer: Scorer, 
             os.fsync(f.fileno())
             log(f"  batch {b // bs + 1}/{-(-len(todo) // bs)}: {min(b + bs, len(todo))}/{len(todo)} sequences")
     return {"n_units": n_units, "n_sequences": len(keys), "n_scored_now": len(todo), "n_already": len(done),
+            "n_reused": len(reused),
             "n_boundary_merge": n_merge, "revision": plan["revision"]}

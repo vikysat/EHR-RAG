@@ -974,14 +974,18 @@ def cmd_probe_targets(args: argparse.Namespace) -> int:
             out[key(u)] = out.get(key(u), 0) + 1
         return dict(sorted(out.items()))
 
-    n_ctx = {c: sum(1 for u in units if c in u.contexts) for c in
-             ("original", "cited_edit", "within_flag", "matched_null", "ablation")}
-    n_seq = sum(len(u.contexts) * (2 + ((2 + bool(u.number_alt_within)) if u.number else 0)) for u in units)
+    from ehr_rag.probe.targets import CONTEXTS, TERM_ONLY_CONTEXTS
+
+    n_ctx = {c: sum(1 for u in units if c in u.contexts) for c in CONTEXTS}
+    n_seq = sum(2 + (0 if c in TERM_ONLY_CONTEXTS or not u.number else 2 + bool(u.number_alt_within))
+                for u in units for c in u.contexts)
     print(f"split: {res['split']}; admissions: {res['n_admissions']}; units: {len(units)} {count(lambda u: u.claim_kind)}; "
-          f"order {count(lambda u: u.order)}; corroborated {sum(1 for u in units if u.corroborated)}")
+          f"order {count(lambda u: u.order)}; corroborated {sum(1 for u in units if u.corroborated)}; "
+          f"prefix mentions the cited lab {sum(1 for u in units if u.prefix_mentions_lab)} "
+          f"(prefix edited: {sum(1 for u in units if u.prefix_values or u.prefix_flips)})")
     print(f"contexts: {n_ctx}")
-    print(f"expected forward passes: {n_seq} (one per scored continuation; run-probe prints the exact number "
-          "after de-duplication)")
+    print(f"expected forward passes: {n_seq} (one per scored continuation; run-probe --plan-only prints the exact "
+          "number after de-duplication and reuse)")
     print(f"skips: {sum(res['skip_reasons'].values())} {res['skip_reasons']}")
     run.finish(generation_runs=args.generation_run, split=res["split"], n_units=len(units), n_contexts=n_ctx,
                n_sequences=n_seq, skip_reasons=res["skip_reasons"])
@@ -1010,12 +1014,21 @@ def cmd_run_probe(args: argparse.Namespace) -> int:
     except score.ProbeError as e:
         print(f"STOP - {e}", file=sys.stderr)
         return 4
+    reuse = []
+    for r in args.reuse_scores or []:
+        d = _run_dir(cfg, r, "run-probe")
+        rmeta = _read_json(d / "run_meta.json")
+        if rmeta.get("command") != "run-probe":
+            raise ConfigError(f"--reuse-scores {r}: not a run-probe run")
+        if split == "test" and rmeta.get("threshold_sha256") != (thr["sha256"] if thr else None):
+            raise ConfigError(f"--reuse-scores {r}: scored under a different threshold hash")
+        reuse.append(d)
     if args.plan_only:                     # no run folder, no model
         from ehr_rag.probe.runner import SCORES_FILE, probe_plan
 
         done = project_root(cfg) / "runs" / args.resume / SCORES_FILE if args.resume else None
         try:
-            probe_plan(cfg, tdir, done)
+            probe_plan(cfg, tdir, done, reuse_dirs=reuse)
         except score.ProbeError as e:
             print(f"STOP - {e}", file=sys.stderr)
             return 4
@@ -1037,10 +1050,12 @@ def cmd_run_probe(args: argparse.Namespace) -> int:
     run.meta.update(targets_run=args.targets_run, split=split, backend=gen["backend"], model=gen["model"],
                     gpu_name=gpu_name(), hf_hub_offline=os.environ.get("HF_HUB_OFFLINE"),
                     threshold_sha256=thr["sha256"] if thr else None)
+    if reuse:
+        run.meta["reuse_scores"] = sorted(set(run.meta.get("reuse_scores", [])) | {d.name for d in reuse})
     run.write_json("run_meta.json", run.meta)
     print(f"run: {run.path}")
     try:
-        res = run_probe(cfg, tdir, run, score.make_scorer(gen), resume=bool(args.resume))
+        res = run_probe(cfg, tdir, run, score.make_scorer(gen), resume=bool(args.resume), reuse_dirs=reuse)
     except (score.ProbeError, BackendError, OSError, ValueError) as e:
         print(f"STOP - probe failed: {e}", file=sys.stderr)
         run.finish(status="failed", error=repr(e))
@@ -1048,8 +1063,8 @@ def cmd_run_probe(args: argparse.Namespace) -> int:
     except BaseException as e:
         run.finish(status="interrupted", error=repr(e))
         raise
-    print(f"\nunits: {res['n_units']}; sequences: {res['n_sequences']} ({res['n_already']} from before, "
-          f"{res['n_scored_now']} scored now); boundary merges: {res['n_boundary_merge']}")
+    print(f"\nunits: {res['n_units']}; sequences: {res['n_sequences']} ({res['n_already']} from before, of them "
+          f"{res['n_reused']} reused now; {res['n_scored_now']} scored now); boundary merges: {res['n_boundary_merge']}")
     run.finish(model_revision=res["revision"], n_sequences=res["n_sequences"], n_scored_now=res["n_scored_now"])
     print(f"run: {run.path}")
     return 0
@@ -1363,7 +1378,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("probe-targets", cmd_probe_targets,
             "Citation-dependence probe: first lab-direction claim per lab group in each plain ehr_rag report, with "
-            "original / cited-edit / within-flag / matched-null / ablation contexts.")
+            "original / cited-edit / cited-edit-prefix / within-flag / matched-null / ablation contexts.")
     p.add_argument("--generation-run", required=True, nargs="+", help="run id(s) with plain ehr_rag reports")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("run-probe", cmd_run_probe,
@@ -1377,6 +1392,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plan-only", action="store_true",
                    help="print the forward-pass plan (and a PLAN json line) and exit; with --resume, count what "
                         "that run already scored")
+    p.add_argument("--reuse-scores", nargs="+", metavar="RUN",
+                   help="earlier run-probe run(s) whose scored sequences are copied when the key (prompt, prefix, "
+                        "continuation) is in this plan; same model and revision required. Only new sequences are "
+                        "scored")
     p = add("probe-threshold", cmd_probe_threshold,
             "Citation-dependence probe: write the 'not dependent' threshold (DEV matched-null and within-flag "
             "drops) to probe.threshold_file with its sha256.")

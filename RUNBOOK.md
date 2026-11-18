@@ -577,6 +577,26 @@ python -m ehr_rag.cli make-tables --config config/full.yaml --evaluate-run <EVAL
 ```
 Table 6 (`table_6_probe.md`) is the probe; stdout shows counts and shares only.
 
+### 13.3 Adding the prefix check to probe runs that already exist
+
+The `cited_edit_prefix` context and `prefix_mentions_lab` come from `probe-targets`, so make a new
+targets run (CPU, same generation runs; the units are the same). The new run-probe copies every sequence
+the old run already scored (`--reuse-scores`; same model and revision required, the key is prompt +
+prefix + continuation) and scores only the new prefix-edited ones. The frozen threshold is reused: do
+NOT run probe-threshold again. Test (dev is the same without `--threshold-sha256`):
+```bash
+source .venv/bin/activate && export HF_HUB_OFFLINE=1
+PROBE_SHA=$(python -c "import yaml;print(yaml.safe_load(open('config/probe_threshold.yaml'))['sha256'])")
+python -m ehr_rag.cli probe-targets --config config/full.yaml --generation-run <TEST_GEN>    # -> PROBE_TARGETS_TEST2
+python -m ehr_rag.cli run-probe --config config/full.yaml --targets-run <PROBE_TARGETS_TEST2> --threshold-sha256 $PROBE_SHA --reuse-scores <OLD_RUN_PROBE_TEST> --plan-only    # reused / to run
+RID=$(date +%Y%m%d-%H%M%S)-run-probe-test-prefix; mkdir -p runs/$RID; echo $RID
+nohup python -m ehr_rag.cli run-probe --config config/full.yaml --targets-run <PROBE_TARGETS_TEST2> --threshold-sha256 $PROBE_SHA --reuse-scores <OLD_RUN_PROBE_TEST> --run-id $RID > runs/$RID/stdout.log 2>&1 &
+# after a session ends (copies nothing twice):
+nohup python -m ehr_rag.cli run-probe --config config/full.yaml --targets-run <PROBE_TARGETS_TEST2> --threshold-sha256 $PROBE_SHA --reuse-scores <OLD_RUN_PROBE_TEST> --resume $RID >> runs/$RID/stdout.log 2>&1 &
+python -m ehr_rag.cli analyze-probe --config config/full.yaml --probe-run $RID --evaluate-run <EVAL_TEST> --threshold-sha256 $PROBE_SHA                                                               # -> PROBE_TEST2
+```
+Then make-tables with `--probe-run <PROBE_TEST2>`.
+
 ---
 
 ## 14. Everything remaining in one go: `scripts/run_all.sh` (GPU machine, nohup)

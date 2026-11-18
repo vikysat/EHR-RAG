@@ -21,10 +21,24 @@ Contexts (same retrieved set and prompt; only the evidence changes):
   matched_null  ``audit_edit`` of a shown lab unit cited NOWHERE in the report whose status
                 (high/low/mixed/normal) equals the cited unit's, shuffled with
                 ``f"{seed}:{hadm}:{cited unit}:null"``; missing if there is none
+  cited_edit_prefix  the cited edit PLUS the same edit applied to the forced report prefix
+                (``prefix_consistency``): term continuations only; identical to cited_edit (so scored
+                once) when the prefix has nothing to edit
   ablation      every corroborator removed (no renumbering): other shown labs of the claim's
                 groups, diagnosis/history/procedure units whose title contains a form of a lexicon
                 term over those groups with the claim's direction, and medications in the
                 APPROXIMATE ``probe.related_drugs`` list; only for corroborated units
+
+Prefix check (``prefix_consistency``): the forced prefix is the report text before ``term_cut``
+(never the prompt). Per claim segment of the prefix (as above), ``prefix_lab_names`` counts lab-name
+mentions (checker names and abbreviation groups) of the cited unit's lab concept;
+``prefix_values`` counts numbers that match an original value of the cited unit
+(``Checker.number_matches``) in a segment that names that lab or cites the cited unit (so a WBC of
+4.0 is not read as a potassium of 4.0); ``prefix_flips`` counts direction claims about that lab
+(``Checker.direction_claim_spans``). ``prefix_mentions_lab`` = names or values. The prefix edit
+replaces each such value with the cited edit's value (stated decimals) and each such direction word
+or term with its edit-consistent alternative. (A unit is its lab's FIRST direction claim, so
+prefix flips are rare by construction; values and names are not.)
 
 Alternative (scored against the original term): consistent with the cited edit. The edit's new
 state is normal (to_normal), high or low. Direction word -> the first word of that direction in
@@ -49,7 +63,9 @@ from ehr_rag.perturb.edit import EditResult, SkipEdit, audit_edit, fmt, physiolo
 from ehr_rag.perturb.edit import decimal_places
 from ehr_rag.perturb.select_targets import _NUMBER_RE, LAB_POINTS, lab_status, range_skip_reason, to_decimal
 
-CONTEXTS: tuple[str, ...] = ("original", "cited_edit", "within_flag", "matched_null", "ablation")
+CONTEXTS: tuple[str, ...] = ("original", "cited_edit", "cited_edit_prefix", "within_flag", "matched_null", "ablation")
+TERM_ONLY_CONTEXTS = ("cited_edit_prefix",)
+CRLF = chr(13) + chr(10)
 NEW_STATE = {"to_normal": "normal", "to_high": "high", "to_low": "low"}
 DX_TYPES = ("diagnosis", "history_diagnosis", "procedure")
 _LEAD_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])?\s*")
@@ -57,7 +73,8 @@ _LEAD_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])?\s*")
 UNIT_COLUMNS = ["probe_id", "hadm_id", "section", "sentence_index", "line_no", "claim_kind", "surface", "direction",
                 "groups", "negated", "cited_unit", "status", "edit_type", "term_start", "term_end", "term_cut",
                 "term_alt", "number", "number_start", "number_end", "number_cut", "number_alt_cited",
-                "number_alt_within", "order", "corroborators", "corroborated", "null_unit", "contexts"]
+                "number_alt_within", "order", "corroborators", "corroborated", "null_unit", "prefix_mentions_lab",
+                "prefix_lab_names", "prefix_values", "prefix_flips", "contexts"]
 
 
 @dataclass
@@ -89,6 +106,9 @@ class ProbeUnit:
     order: str = "no_number"     # number_first | term_first | no_number
     corroborators: list[str] = field(default_factory=list)
     null_unit: str = ""
+    prefix_lab_names: int = 0
+    prefix_values: int = 0
+    prefix_flips: int = 0
     contexts: list[str] = field(default_factory=list)
     probe_id: str = ""
 
@@ -96,10 +116,14 @@ class ProbeUnit:
     def corroborated(self) -> bool:
         return bool(self.corroborators)
 
+    @property
+    def prefix_mentions_lab(self) -> bool:
+        return bool(self.prefix_lab_names or self.prefix_values)
+
     def row(self) -> dict[str, Any]:
         d = asdict(self)
         d.update(groups=" | ".join(self.groups), corroborators=" ".join(self.corroborators),
-                 corroborated=self.corroborated, contexts=" ".join(self.contexts))
+                 corroborated=self.corroborated, prefix_mentions_lab=self.prefix_mentions_lab, contexts=" ".join(self.contexts))
         return {k: d[k] for k in UNIT_COLUMNS}
 
 
@@ -220,6 +244,69 @@ def _stated(value: str, stated: str) -> str:
 
 
 @dataclass
+class PrefixInfo:
+    lab_names: int
+    values: int
+    flips: int
+    edits: list[list[Any]]       # [start, end, replacement] in raw-text offsets, all before the cut
+
+
+def prefix_consistency(checker: Any, ctx: Any, words: dict[str, str], raw: str, cut: int, unit: EvidenceUnit,
+                       ce: EditResult) -> PrefixInfo:
+    """Mentions of the cited lab in ``raw[:cut]`` and the prefix edit matching the cited edit (module docstring)."""
+    concept = ctx.concept(unit)
+    pts = {p: to_decimal(unit.fields[p]["value"]) for p in LAB_POINTS if unit.fields.get(p)}
+    info = PrefixInfo(0, 0, 0, [])
+    pos = 0
+    for line in raw.splitlines(keepends=True):
+        if pos >= cut:
+            break
+        body = line.rstrip(CRLF)
+        lim = min(len(body), cut - pos)
+        lead = _LEAD_RE.match(body).end()    # type: ignore[union-attr]
+        for s0, s1 in claim_segments(body):
+            if s0 >= lim:
+                break
+            seg = body[s0:min(s1, lim)]
+            ms = ctx.mentions(seg)
+            names = sum(1 for m in ms if m.kind == "lab" and m.key == concept)
+            info.lab_names += names
+            ids = claim_citation(body, s0)[2]
+            if names or unit.unit_id in ids:
+                masked = checker.mask(seg)
+                for m in _NUMBER_RE.finditer(masked, max(0, lead - s0)):
+                    tok = m.group(1).lstrip("-")
+                    d = to_decimal(tok)
+                    hit = [p for p, v in pts.items() if d is not None and v is not None
+                           and checker.number_matches(d, [v])]
+                    if hit:
+                        a = m.start(1) + (len(m.group(1)) - len(tok))
+                        info.values += 1
+                        info.edits.append([pos + s0 + a, pos + s0 + m.end(1),
+                                           _stated(ce.edited_fields[hit[0]]["value"], tok)])
+            for _, m, direction, _neg, word, a, b in checker.direction_claim_spans(seg, ms):
+                gs = list(m.term["labs"]) if m.kind == "term" else [m.key]
+                if concept not in gs:
+                    continue
+                alt = alternative(checker, words, "term" if m.kind == "term" else "word", direction, m.term,
+                                  ce.edit_type)
+                if alt is not None:
+                    info.flips += 1
+                    info.edits.append([pos + s0 + a, pos + s0 + b, _cap(alt, s0 + a == lead)])
+        pos += len(line)
+    info.edits.sort()
+    return info
+
+
+def apply_prefix_edits(prefix: str, edits: list[list[Any]]) -> str:
+    """``prefix`` with every edit lying wholly inside it applied."""
+    for a, b, new in sorted(edits, reverse=True):
+        if b <= len(prefix):
+            prefix = prefix[:a] + new + prefix[b:]
+    return prefix
+
+
+@dataclass
 class ReportProbe:
     units: list[ProbeUnit]
     skips: list[dict[str, Any]]
@@ -293,7 +380,11 @@ def probe_report(hadm_id: int, raw: str, parsed: ParsedReport, shown: list[Evide
             pu = ProbeUnit(hadm_id, s.section, s.index, s.line_no, kind, word, direction, groups, negated, u.unit_id,
                            lab_status(u.fields), ce.edit_type, base + a, base + b, base + _cut(line, a, 0),
                            _cap(alt, at_start))
-            specs: dict[str, dict[str, Any]] = {"original": {}, "cited_edit": {"replace": [ce.to_dict()]}}
+            pi = prefix_consistency(checker, ctx, words, raw, base + _cut(line, a, 0), u, ce)
+            pu.prefix_lab_names, pu.prefix_values, pu.prefix_flips = pi.lab_names, pi.values, pi.flips
+            specs: dict[str, dict[str, Any]] = {"original": {}, "cited_edit": {"replace": [ce.to_dict()]},
+                                                "cited_edit_prefix": {"replace": [ce.to_dict()],
+                                                                      "prefix_edits": pi.edits}}
             try:
                 wf = within_flag_edit(u, pc["within_flag_percent"], f"{pc['seed']}:{hadm_id}:{u.unit_id}:within",
                                       _bounds(checker, u, pc["physiologic_bounds"]))

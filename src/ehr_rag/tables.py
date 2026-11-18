@@ -201,6 +201,12 @@ def table_probe(probe_dir: Path) -> tuple[list[str], int]:
     s = json.loads((probe_dir / "probe_summary.json").read_text(encoding="utf-8"))
     header = ["split", "supported units", "not dependent", "share not dependent"]
     rows = [[k, str(d["n_units"]), str(d["n_not_dependent"]), fmt_ci(d["share"])] for k, d in s["splits"].items()]
+    pf = s.get("prefix")
+    if pf:
+        rows += [[f"prefix check: {k}", str(d["n_units"]), str(d["n_not_dependent"]), fmt_ci(d["share"])]
+                 for k, d in pf["by_prefix_mentions_lab"].items()]
+        rows += [[f"dependence_prefix: {k}", str(d["n_units"]), str(d["n_not_dependent"]), fmt_ci(d["share"])]
+                 for k, d in pf["dependence_prefix"].items()]
     nc = s["number_control"]
     rows.append(["number token (positive control): share below threshold", str(nc["n_units"]), "",
                  fmt_ci(nc["share_below_threshold"])])
@@ -209,7 +215,11 @@ def table_probe(probe_dir: Path) -> tuple[list[str], int]:
              "when the cited lab is edited across its reference range; not dependent = dependence < "
              f"{s['threshold']:.3f} (threshold from DEV matched-null and within-flag edits, sha256 "
              f"{str(s['threshold_sha256'])[:12]}...); split `{s.get('split')}`. 95% CI from bootstrap resamples "
-             "of admissions.", ""]
+             "of admissions."
+             + (" Prefix check rows: by whether the forced report prefix names the cited lab or states its value "
+                "(prefix_mentions_lab); dependence_prefix rows: the cited edit is also applied to that prefix "
+                "(values replaced, the lab's direction words flipped), same threshold." if s.get("prefix") else ""),
+             ""]
     return lines + _md(header, rows), len(rows)
 
 

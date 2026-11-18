@@ -5,6 +5,7 @@ continuation's token log-probabilities under the same forced prefix. (``*_first`
 the first token where the two continuations differ.) Per unit:
 
   dependence        s(original) - s(cited_edit)
+  dependence_prefix s(original) - s(cited_edit_prefix)   (cited edit plus the same edit in the forced prefix)
   within_flag_drop  s(original) - s(within_flag)
   null_drop         s(original) - s(matched_null)
   ablation_drop     s(original) - s(ablation)
@@ -22,6 +23,12 @@ units (``supported`` in the evaluate run's sentences.jsonl, plain ehr_rag; the c
 term), the share with dependence < threshold ("not dependent"), overall and by order
 (number_first / term_first / no_number), corroborated vs not, and section; 95% CIs from
 ``probe.bootstrap_resamples`` bootstrap resamples of admissions.
+
+Prefix check (same pool, same threshold, same bootstrap): the not-dependent share by section x
+``prefix_mentions_lab`` (whether the forced report prefix names the cited lab or states its value),
+using ``dependence``; and the not-dependent share using ``dependence_prefix`` instead, overall, by
+``prefix_mentions_lab`` and by section x ``prefix_mentions_lab``. Units of a targets run made before
+the prefix check have no ``prefix_mentions_lab`` / ``dependence_prefix`` and are left out of these.
 """
 
 from __future__ import annotations
@@ -38,9 +45,11 @@ from ehr_rag.probe.score import ProbeError, common_prefix
 from ehr_rag.stats import bootstrap, fmt_ci, percentile, ratio_stat
 
 SCORED_COLUMNS = ["probe_id", "hadm_id", "section", "claim_kind", "direction", "groups", "order", "corroborated",
-                  "contexts", "s_original", "s_cited_edit", "s_within_flag", "s_matched_null", "s_ablation",
-                  "dependence", "within_flag_drop", "null_drop", "ablation_drop", "dependence_first",
-                  "num_dependence", "num_within_drop", "supported", "not_dependent"]
+                  "prefix_mentions_lab", "contexts", "s_original", "s_cited_edit", "s_cited_edit_prefix",
+                  "s_within_flag", "s_matched_null", "s_ablation", "dependence", "dependence_prefix",
+                  "within_flag_drop", "null_drop", "ablation_drop", "dependence_first", "num_dependence",
+                  "num_within_drop", "supported", "not_dependent", "not_dependent_prefix"]
+PREFIX_SPLITS = ("yes", "no")
 
 
 def _diff(a: dict[str, Any] | None, b: dict[str, Any] | None, first: bool = False) -> float | None:
@@ -75,7 +84,7 @@ def unit_scores(targets_dir: Path, probe_dirs: list[Path]) -> list[dict[str, Any
             return by.get((pid, c, role))
 
         s = {c: _diff(g(c, "term_orig"), g(c, "term_alt")) for c in
-             ("original", "cited_edit", "within_flag", "matched_null", "ablation")}
+             ("original", "cited_edit", "cited_edit_prefix", "within_flag", "matched_null", "ablation")}
         sf = {c: _diff(g(c, "term_orig"), g(c, "term_alt"), first=True) for c in ("original", "cited_edit")}
         num = {c: _diff(g(c, "num_orig"), g(c, "num_alt_cited")) for c in ("original", "cited_edit")}
         nwf = {c: _diff(g(c, "num_orig"), g(c, "num_alt_within")) for c in ("original", "within_flag")}
@@ -83,8 +92,10 @@ def unit_scores(targets_dir: Path, probe_dirs: list[Path]) -> list[dict[str, Any
             "probe_id": pid, "hadm_id": int(u["hadm_id"]), "section": u["section"], "claim_kind": u["claim_kind"],
             "direction": u["direction"], "groups": u["groups"], "order": u["order"],
             "corroborated": u["corroborated"] == "True", "contexts": u["contexts"],
+            "prefix_mentions_lab": {"True": True, "False": False}.get(u.get("prefix_mentions_lab", "")),
             **{f"s_{c}": v for c, v in s.items()},
             "dependence": _minus(s["original"], s["cited_edit"]),
+            "dependence_prefix": _minus(s["original"], s["cited_edit_prefix"]),
             "within_flag_drop": _minus(s["original"], s["within_flag"]),
             "null_drop": _minus(s["original"], s["matched_null"]),
             "ablation_drop": _minus(s["original"], s["ablation"]),
@@ -142,8 +153,8 @@ def nli_supported(eval_dir: Path, rows: list[dict[str, Any]], targets_dir: Path)
         r["supported"] = bool(hit[0]["supported"]) if hit else None
 
 
-def _share_stat(items: list[list[dict[str, Any]]]) -> float | None:
-    return ratio_stat(lambda xs: sum(1 for x in xs if x["not_dependent"]), lambda xs: len(xs))(items)
+def _share_stat(field: str = "not_dependent") -> Any:
+    return ratio_stat(lambda xs: sum(1 for x in xs if x[field]), lambda xs: len(xs))
 
 
 def summarize(rows: list[dict[str, Any]], threshold: dict[str, Any], n_boot: int, seed: int) -> dict[str, Any]:
@@ -151,15 +162,20 @@ def summarize(rows: list[dict[str, Any]], threshold: dict[str, Any], n_boot: int
     thr = threshold["threshold"]
     for r in rows:
         r["not_dependent"] = None if r["dependence"] is None else r["dependence"] < thr
+        dp = r.get("dependence_prefix")
+        r["not_dependent_prefix"] = None if dp is None else dp < thr
     scored = [r for r in rows if r["dependence"] is not None]
     pool = [r for r in scored if r.get("supported")]
 
-    def share(sel: list[dict[str, Any]], tag: str) -> dict[str, Any]:
+    def share(sel: list[dict[str, Any]], tag: str, field: str = "not_dependent") -> dict[str, Any]:
         groups: dict[int, list[dict[str, Any]]] = {}
         for r in sel:
             groups.setdefault(r["hadm_id"], []).append(r)
-        res = bootstrap(groups, _share_stat, n_boot, f"{seed}:probe:{tag}")
-        return {"n_units": len(sel), "n_not_dependent": sum(1 for r in sel if r["not_dependent"]), "share": res}
+        res = bootstrap(groups, _share_stat(field), n_boot, f"{seed}:probe:{tag}")
+        return {"n_units": len(sel), "n_not_dependent": sum(1 for r in sel if r[field]), "share": res}
+
+    def pm(r: dict[str, Any], v: str) -> bool:
+        return r.get("prefix_mentions_lab") is (v == "yes")
 
     splits: dict[str, dict[str, Any]] = {"all": share(pool, "all")}
     for o in ("number_first", "term_first", "no_number"):
@@ -168,6 +184,22 @@ def summarize(rows: list[dict[str, Any]], threshold: dict[str, Any], n_boot: int
         splits[f"corroborated={'yes' if c else 'no'}"] = share([r for r in pool if r["corroborated"] == c], str(c))
     for sec in SECTIONS:
         splits[f"section={sec}"] = share([r for r in pool if r["section"] == sec], sec)
+    by_prefix: dict[str, dict[str, Any]] = {}
+    for v in PREFIX_SPLITS:
+        by_prefix[f"prefix_mentions_lab={v}"] = share([r for r in pool if pm(r, v)], f"pm:{v}")
+    for sec in SECTIONS:
+        for v in PREFIX_SPLITS:
+            by_prefix[f"section={sec}, prefix_mentions_lab={v}"] = share(
+                [r for r in pool if r["section"] == sec and pm(r, v)], f"{sec}:pm:{v}")
+    ppool = [r for r in pool if r["dependence_prefix"] is not None]
+    prefix_dep: dict[str, dict[str, Any]] = {"all": share(ppool, "dp:all", "not_dependent_prefix")}
+    for v in PREFIX_SPLITS:
+        prefix_dep[f"prefix_mentions_lab={v}"] = share([r for r in ppool if pm(r, v)], f"dp:pm:{v}",
+                                                       "not_dependent_prefix")
+    for sec in SECTIONS:
+        for v in PREFIX_SPLITS:
+            prefix_dep[f"section={sec}, prefix_mentions_lab={v}"] = share(
+                [r for r in ppool if r["section"] == sec and pm(r, v)], f"dp:{sec}:pm:{v}", "not_dependent_prefix")
     num = [r for r in pool if r["num_dependence"] is not None]
     by_h: dict[int, list[dict[str, Any]]] = {}
     for r in num:
@@ -179,6 +211,8 @@ def summarize(rows: list[dict[str, Any]], threshold: dict[str, Any], n_boot: int
         "n_scored": len(scored), "n_supported": len(pool),
         "n_supported_unknown": sum(1 for r in scored if r.get("supported") is None),
         "splits": splits,
+        "prefix": {"n_supported_with_prefix_flag": sum(1 for r in pool if r.get("prefix_mentions_lab") is not None),
+                   "by_prefix_mentions_lab": by_prefix, "dependence_prefix": prefix_dep},
         "number_control": {"n_units": len(num),
                            "mean_num_dependence": bootstrap(by_h, mean, n_boot, f"{seed}:probe:num_mean"),
                            "share_below_threshold": bootstrap(by_h, num_below, n_boot, f"{seed}:probe:num_share")},
@@ -195,6 +229,18 @@ def summary_markdown(s: dict[str, Any], runs: list[str]) -> str:
              "| split | units | not dependent | share [95% CI] |", "|---|---:|---:|---|"]
     for k, d in s["splits"].items():
         lines.append(f"| {k} | {d['n_units']} | {d['n_not_dependent']} | {fmt_ci(d['share'])} |")
+    pf = s.get("prefix")
+    if pf:
+        lines += ["", "Prefix check: same share (dependence) by section x whether the forced report prefix names the "
+                  "cited lab or states its value.", "", "| split | units | not dependent | share [95% CI] |",
+                  "|---|---:|---:|---|"]
+        for k, d in pf["by_prefix_mentions_lab"].items():
+            lines.append(f"| {k} | {d['n_units']} | {d['n_not_dependent']} | {fmt_ci(d['share'])} |")
+        lines += ["", "Not-dependent share using dependence_prefix (cited edit plus the same edit applied to the "
+                  "forced prefix: values replaced, that lab's direction words flipped).", "",
+                  "| split | units | not dependent | share [95% CI] |", "|---|---:|---:|---|"]
+        for k, d in pf["dependence_prefix"].items():
+            lines.append(f"| {k} | {d['n_units']} | {d['n_not_dependent']} | {fmt_ci(d['share'])} |")
     nc = s["number_control"]
     lines += ["", f"Positive control (number token, {nc['n_units']} supported units with a number): mean dependence "
               f"{fmt_ci(nc['mean_num_dependence'])}; share below the term threshold "
