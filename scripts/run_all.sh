@@ -6,7 +6,9 @@
 #   scripts/run_all.sh --dry-run                       # print the plan: skip / resume / start per step
 #   tail -f ~/scratch/logs/run_all.log
 #
-# Re-running is safe: finished steps are skipped, run-probe resumes, generation reuses its cache.
+# Re-running is safe: finished steps are skipped, run-probe resumes, generation reuses its cache; the
+# retrieval metrics and the final tables (step 12) run again whenever their inputs (the labeled sheets) change.
+# The end of every run lists the labeling sheets still to label and the `label` commands for them.
 # Stops at the first error. Log: ~/scratch/logs/run_all.log; run ids: ~/scratch/logs/run_all_ids.txt.
 # RUN_ALL_LOG_DIR overrides ~/scratch/logs. Extra arguments go to `python -m ehr_rag.run_all`
 # (--config, --references, --dry-run).

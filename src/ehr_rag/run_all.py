@@ -16,8 +16,20 @@ Inputs are the fixed runs in ``INPUTS``. Steps (each ends with a ``STEP n done``
   8  probe on test with ``--threshold-sha256`` from step 7: probe-targets, run-probe, analyze-probe
   9  ``make-tables`` (evaluations: test + step 4; check run 5; text metrics 6; probe 8; manual labels
      ``runs/<test evaluation>/manual_review_labeled.csv`` if that file exists)
+  10 prefix check on test: a new probe-targets run (adds the cited_edit_prefix context and
+     prefix_mentions_lab), run-probe with ``--reuse-scores <step 8 run-probe>`` (only the new sequences are
+     scored, in a new run; resumable) under the frozen threshold hash, analyze-probe
+  11 labeling sheets (runs right after step 6, before the long GPU probe steps, so labeling can start):
+     ``labeling-sheets`` (50 test sentences from 50 admissions, plain ehr_rag and ehr_rag_enforced, condition
+     hidden in labeling_key.csv; re-label sheet of 15) and ``export-relevance --split dev --n-pairs 15``
+  12 once filled: ``retrieval-metrics`` on the relevance sheet; ``make-tables`` with everything (probe from
+     step 10, manual labels table 7, retrieval table 8). Both re-run whenever their inputs change (arguments or
+     the sheets' contents; fingerprint ``<key>_inputs`` in the ids file)
 
-Before steps 2, 7 and 8 the expected GPU calls / forward passes are printed (``--plan-only``; for the
+At the end of every run (also after a stop) the sheets still to label are listed with their ``label``
+commands.
+
+Before steps 2, 7, 8 and 10 the expected GPU calls / forward passes are printed (``--plan-only``; for the
 probe this comes after probe-targets, which is what defines the sequences).
 
 Re-running: every run id this creates is appended to the ids file (``key<TAB>value<TAB>time``; the
@@ -283,8 +295,9 @@ class Pipeline:
             resume = ["--resume", rp] if rp and self.status(rp) != "missing" else []
             p = self.plan(["run-probe", "--targets-run", t, *thr, "--plan-only", *resume])
             if p is not None:
+                reused = f", {p['reused']} copied from earlier runs" if p.get("reused") else ""
                 self.out(f"STEP {n} expected forward passes: {p['todo']} to run of {p['sequences']} "
-                         f"({p['done']} already scored), {p['batches']} batches")
+                         f"({p['done']} already scored{reused}), {p['batches']} batches")
         rp = self.cli(key, f"rall-run-probe-{split}", ["run-probe", "--targets-run", t, *thr], resumable=True)
         return t, rp
 
@@ -342,21 +355,160 @@ class Pipeline:
         self.done(9)
         return rid
 
+    def step10(self, sha: str) -> str:
+        """Prefix check: a new targets run (adds cited_edit_prefix), scoring only the sequences step 8 lacks."""
+        old = self.ledger.get("s8_run_probe") or "<s8_run_probe>"
+        thr = ["--threshold-sha256", sha]
+        _, rp = self.probe(10, "test-prefix", INPUTS["test_generation"], INPUTS["test_evaluation"],
+                           [*thr, "--reuse-scores", old])
+        a = self.cli("s10_analyze_probe", "rall-analyze-probe-test-prefix",
+                     ["analyze-probe", "--probe-run", rp, "--evaluate-run", INPUTS["test_evaluation"], *thr])
+        self.done(10, "(prefix check; frozen dev threshold reused)")
+        return a
+
+    def step11(self, ev: str) -> None:
+        """Labeling sheets: manual review + re-label (test, plain and enforced) and retrieval relevance (dev)."""
+        self.cli("s11_sheets", "rall-labeling-sheets",
+                 ["labeling-sheets", "--evaluate-run", INPUTS["test_evaluation"], ev,
+                  "--conditions", "ehr_rag", "ehr_rag_enforced", "--n", "50", "--n-relabel", "15"])
+        self.cli("s11_relevance", "rall-export-relevance", ["export-relevance", "--split", "dev", "--n-pairs", "15"])
+        self.done(11, "(labeling sheets; label them with the commands printed at the end)")
+
+    def step12(self, ev: str, check: str, tm: str, probe: str) -> str:
+        """Retrieval metrics once the relevance sheet is filled; tables again whenever an input changed."""
+        from ehr_rag.labeling import KEY_FILE, MANUAL_SHEET, RELABEL_SHEET, RELEVANCE_SHEET, sheet_complete
+
+        files: list[Path] = []
+        args = ["make-tables", "--evaluate-run", INPUTS["test_evaluation"], ev, "--check-run", check,
+                "--text-metrics-run", tm, "--probe-run", probe]
+        rel = self._sheet("s11_relevance", RELEVANCE_SHEET)
+        if rel is not None and sheet_complete(rel):
+            rm = self.cli_tracked("s12_retrieval_metrics", "rall-retrieval-metrics",
+                                  ["retrieval-metrics", "--labels", self._show(rel)], [rel])
+            args += ["--retrieval-metrics-run", rm]
+        else:
+            self.out("  retrieval-metrics: waiting for the relevance sheet to be fully labeled")
+        man = self._sheet("s11_sheets", MANUAL_SHEET)
+        if man is not None and sheet_complete(man):
+            key = man.with_name(KEY_FILE)
+            args += ["--label-sheet", self._show(man), "--label-key", self._show(key)]
+            files += [man, key]
+            again = man.with_name(RELABEL_SHEET)
+            if sheet_complete(again):
+                args += ["--relabel-sheet", self._show(again)]
+                files.append(again)
+            else:
+                self.out("  tables: re-label sheet not fully labeled yet (no intra-annotator kappa)")
+        else:
+            self.out("  tables: manual review sheet not fully labeled yet (no manual-label table)")
+        rid = self.cli_tracked("s12_make_tables", "rall-make-tables-final", args, files)
+        self.done(12, f"(tables: {self._show(self.runs / rid / 'tables.md')})")
+        return rid
+
+    # ---------------------------------------------------------------- labeling helpers
+
+    def _show(self, p: Path) -> str:
+        """``p`` relative to the working directory when it lies below it (run_all.sh runs from the repo root)."""
+        try:
+            return str(p.resolve().relative_to(Path.cwd().resolve()).as_posix())
+        except (ValueError, OSError):
+            return str(p)
+
+    def _sheet(self, key: str, name: str) -> Path | None:
+        rid = self.ledger.get(key)
+        if not rid or self.status(rid) != "ok":
+            return None
+        return self.runs / rid / name
+
+    def cli_tracked(self, key: str, name: str, args: list[str], files: list[Path]) -> str:
+        """Like ``cli`` for a step that must run again whenever its inputs change: its arguments (upstream run
+        ids, which sheets are included) and the contents of ``files``. The fingerprint is kept in the ids file
+        as ``<key>_inputs``; a different one starts a new run."""
+        import hashlib
+
+        argv0 = [args[0], "--config", self.config, *args[1:]]
+        parts = [json.dumps(argv0)] + [f"{self._show(f)}:{hashlib.sha256(f.read_bytes()).hexdigest()}"
+                                        for f in files]
+        fp = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+        rid = self.ledger.get(key)
+        st = self.status(rid)
+        same = self.ledger.get(f"{key}_inputs") == fp
+        if rid and st == "ok" and same:
+            self.out(f"  {key}: finished earlier as {rid} with the same inputs; skipped")
+            return rid
+        if rid and st == "missing" and same:
+            how = "start (recorded id, never started)"
+        else:
+            how = ("start" if not rid else f"start again (previous run {rid}: "
+                   + ("inputs changed" if st == "ok" else st) + ")")
+            if self.dry:
+                rid = f"<{key}>"
+            else:
+                rid = self._new_id(name)
+                self.ledger.record(key, rid)
+                self.ledger.record(f"{key}_inputs", fp)
+        argv = argv0 + ["--run-id", str(rid)]
+        if self.dry:
+            self.out(f"  {key}: would {how}: python -m ehr_rag.cli {' '.join(argv)}")
+            return str(rid)
+        self.out(f"  {key}: {how} as {rid}")
+        self.call(argv)
+        if self.status(rid) != "ok":
+            raise StepError(f"{key}: run {rid} ended with status {self.status(rid)}")
+        return str(rid)
+
+    def label_todo(self) -> None:
+        """Sheets still to label, with the exact commands (printed at the end of every run, also after a stop)."""
+        from ehr_rag.labeling import MANUAL_SHEET, RELABEL_SHEET, RELEVANCE_SHEET, LabelingError, sheet_status
+
+        self.out("LABELING")
+        sheets = [("s11_sheets", MANUAL_SHEET), ("s11_sheets", RELABEL_SHEET), ("s11_relevance", RELEVANCE_SHEET)]
+        todo, made = [], 0
+        for key, name in sheets:
+            p = self._sheet(key, name)
+            if p is None or not p.exists():
+                continue
+            made += 1
+            try:
+                done, total = sheet_status(p)
+            except (LabelingError, OSError, KeyError) as e:
+                self.out(f"  {self._show(p)}: cannot be read ({e})")
+                continue
+            if done < total:
+                todo.append((p, done, total))
+        if not made:
+            self.out("  labeling sheets not made yet (step 11)")
+            return
+        if not todo:
+            self.out("  every sheet is fully labeled")
+            return
+        self.out("  sheets still to label (from the repository root, with the venv active):")
+        for p, done, total in todo:
+            self.out(f"    {self._show(p)}: {done} of {total} labeled")
+            self.out(f"      python -m ehr_rag.cli label --sheet {self._show(p)}")
+        self.out("  then rerun `nohup scripts/run_all.sh > /dev/null 2>&1 &` (step 12: retrieval metrics and tables)")
+
     def run(self) -> None:
         self.out(f"run_all{' (DRY RUN: nothing is executed)' if self.dry else ''}: config {self.config}; "
                  f"ids file {self.ledger.path}")
         self.out("inputs: " + "; ".join(f"{k} {v}" for k, v in INPUTS.items()))
-        self.check_inputs()
-        h = self.step1()
-        enf = self.step2(h)
-        filt = self.step3(h)
-        ev = self.step4(enf, filt)
-        check = self.step5(h, enf, filt)
-        tm = self.step6(enf, filt)
-        sha = self.step7()
-        probe = self.step8(sha)
-        self.step9(ev, check, tm, probe)
-        self.out("ALL STEPS DONE" if not self.dry else "DRY RUN complete")
+        try:
+            self.check_inputs()
+            h = self.step1()
+            enf = self.step2(h)
+            filt = self.step3(h)
+            ev = self.step4(enf, filt)
+            check = self.step5(h, enf, filt)
+            tm = self.step6(enf, filt)
+            self.step11(ev)                # CPU, before the long GPU probe steps: labeling can start at once
+            sha = self.step7()
+            probe = self.step8(sha)
+            self.step9(ev, check, tm, probe)
+            prefix = self.step10(sha)
+            self.step12(ev, check, tm, prefix)
+            self.out("ALL STEPS DONE" if not self.dry else "DRY RUN complete")
+        finally:
+            self.label_todo()
 
 
 def main(argv: list[str] | None = None) -> int:

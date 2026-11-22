@@ -601,18 +601,20 @@ Then make-tables with `--probe-run <PROBE_TEST2>`.
 
 ## 14. Everything remaining in one go: `scripts/run_all.sh` (GPU machine, nohup)
 
-Runs steps 1-9 in order from the fixed inputs (dev generation `20261116-193521-generate`, dev evaluation
+Runs steps 1-12 from the fixed inputs (dev generation `20261116-193521-generate`, dev evaluation
 `20261117-152134-evaluate`, test retrieval `20261117-011229-retrieve`, test generation
 `20261117-011443-generate`, test evaluation `20261117-152041-evaluate`): freeze the checker + dev
 check-citations; enforced test generation (base reports from the cache); enforce-filter; evaluate the
 enforced and drop-only outputs; check-citations on test; text-metrics; probe on dev (with the threshold);
-probe on test; make-tables. Step list and rules: `src/ehr_rag/run_all.py`.
+probe on test; make-tables; then 10 (prefix check), 11 (labeling sheets; runs right after step 6 so labeling
+can start while the probe runs) and 12 (retrieval metrics and the final tables). Step list and rules:
+`src/ehr_rag/run_all.py`.
 
 ```bash
 cd ~/EHR-RAG          # the repository on the GPU machine
 scripts/run_all.sh --dry-run                     # the plan: per step skip / resume / start, no command runs
 nohup scripts/run_all.sh > /dev/null 2>&1 &      # run
-tail -f ~/scratch/logs/run_all.log               # STEP n done markers, expected calls before steps 2, 7, 8
+tail -f ~/scratch/logs/run_all.log               # STEP n done markers, expected calls before steps 2, 7, 8, 10
 ```
 When the session ends (~5 h), start the same `nohup` line again: finished steps are skipped (after checking
 they were made with the same arguments), `run-probe` continues with `--resume`, an unfinished generation
@@ -628,3 +630,33 @@ starts again and takes every finished call from the response cache. The first er
 - Step 2 stops before any call if the base test reports are not all in `cache/generation/`.
 - Text-metrics references default to `data/cohort/reference/references.csv` (`--references` to change).
 - A second copy started while one is running exits at once (`flock`).
+
+### 14.1 Steps 10-12: prefix check, labeling sheets, final tables
+
+- **Step 10** (GPU): a new `probe-targets` run on the test generation (adds `cited_edit_prefix` and
+  `prefix_mentions_lab`), `run-probe --reuse-scores <step 8 run-probe>` in a new run (only the sequences
+  step 8 did not score are scored; resumable) with the frozen `--threshold-sha256` (probe-threshold is NOT
+  run again), and `analyze-probe` (not-dependent share by section x prefix_mentions_lab and using
+  dependence_prefix, admission-bootstrap CIs). Its analyze-probe run is table 6 of the final tables.
+- **Step 11** (CPU): `labeling-sheets` (50 test sentences from 50 admissions, plain `ehr_rag` and
+  `ehr_rag_enforced`, the four sections mixed, shuffled; the condition only in `labeling_key.csv`; 15 items
+  again in `relabel_sheet.csv`) and `export-relevance --split dev --n-pairs 15`. Both write into their run
+  folders under `runs/` (gitignored).
+- **Labeling**: every run ends with a `LABELING` block that lists the sheets still to label and the exact
+  commands, e.g.
+  ```bash
+  source .venv/bin/activate
+  python -m ehr_rag.cli label --sheet runs/<labeling-sheets run>/manual_review_sheet.csv
+  python -m ehr_rag.cli label --sheet runs/<labeling-sheets run>/relabel_sheet.csv
+  python -m ehr_rag.cli label --sheet runs/<export-relevance run>/relevance_to_label.csv
+  ```
+  Keys 1-4 (supported / partially supported / unsupported / contradicted) or y/n, s skip, b back, q quit.
+  Every answer is saved at once; the same command continues where you stopped. Label the re-label sheet
+  some time after the first sheet. `scripts/run_all.sh --dry-run` prints the same block at any time.
+- **Step 12** (CPU): once the relevance sheet is fully labeled, `retrieval-metrics` on it; `make-tables`
+  with the test and enforced evaluations, check-citations, text metrics, step 10's probe analysis, the
+  manual sheets when fully labeled (table 7: unsupported rate = unsupported + contradicted, NLI kappa, and
+  intra-annotator kappa once the re-label sheet is done) and the retrieval metrics (table 8). Both re-run
+  whenever their inputs change: the upstream run ids, which sheets are included, or any label in them (the
+  fingerprint is kept as `<key>_inputs` in the ids file). After labeling, start the `nohup` line again;
+  the final tables are the run named on the `STEP 12 done` line.

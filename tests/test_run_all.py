@@ -85,7 +85,49 @@ class FakeCLI:
             return 1, "STOP - fake failure\n"
         meta["status"] = "ok"
         mp.write_text(json.dumps(meta))
+        if cmd == "labeling-sheets":
+            write_fake_sheets(d)
+        elif cmd == "export-relevance":
+            _write_csv(d / "relevance_to_label.csv", ["hadm_id", "query", "unit_id", "unit_text", "relevant"],
+                       [[1, "q", "E1", "Na 130", ""], [1, "q", "E2", "K 4.0", ""]])
         return 0, f"run: {rid}\n"
+
+
+def _write_csv(path: Path, header: list[str], rows: list[list[Any]]) -> None:
+    import csv
+
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def write_fake_sheets(d: Path) -> None:
+    from ehr_rag.labeling import KEY_COLUMNS, SHEET_COLUMNS
+
+    _write_csv(d / "manual_review_sheet.csv", list(SHEET_COLUMNS),
+               [[f"m0{i}", f"adm_00{i}", "Findings", f"sentence {i}", "[E1] Na 130", "", ""] for i in (1, 2, 3)])
+    _write_csv(d / "relabel_sheet.csv", list(SHEET_COLUMNS),
+               [["r01", "adm_002", "Findings", "sentence 2", "[E1] Na 130", "", ""]])
+    _write_csv(d / "labeling_key.csv", list(KEY_COLUMNS),
+               [[f"m0{i}", "manual_review_sheet.csv", "", "ehr_rag" if i % 2 else "ehr_rag_enforced", f"adm_00{i}",
+                 "Findings", f"k{i}", "ev", "entailment", 1] for i in (1, 2, 3)]
+               + [["r01", "relabel_sheet.csv", "m02", "ehr_rag_enforced", "adm_002", "Findings", "k2", "ev",
+                   "entailment", 1]])
+
+
+def fill(path: Path, column: str, value: str) -> None:
+    import csv
+
+    with path.open(encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        cols, rows = list(r.fieldnames or []), list(r)
+    for row in rows:
+        row[column] = value
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows(rows)
 
 
 def _run(project: dict[str, Any], cli: FakeCLI, dry: bool = False) -> list[str]:
@@ -99,16 +141,19 @@ def _cmds(cli: FakeCLI) -> list[str]:
 
 
 ORDER = ["check-citations", "generate plan", "generate", "enforce-filter", "evaluate", "check-citations",
-         "text-metrics", "probe-targets", "run-probe plan", "run-probe", "probe-threshold", "analyze-probe",
+         "text-metrics", "labeling-sheets", "export-relevance",
+         "probe-targets", "run-probe plan", "run-probe", "probe-threshold", "analyze-probe",
+         "probe-targets", "run-probe plan", "run-probe", "analyze-probe", "make-tables",
          "probe-targets", "run-probe plan", "run-probe", "analyze-probe", "make-tables"]
+STEPS_DONE = ["1", "2", "3", "4", "5", "6", "11", "7", "8", "9", "10", "12"]
 
 
 def test_runs_every_step_in_order_and_a_rerun_skips_everything(project: dict[str, Any]) -> None:
     cli = FakeCLI(project["root"])
     out = _run(project, cli)
     assert _cmds(cli) == ORDER
-    assert [x.split()[1] for x in out if x.startswith("STEP") and " done" in x] == [str(i) for i in range(1, 10)]
-    for n in (2, 7, 8):                                   # expected calls / passes before the GPU part
+    assert [x.split()[1] for x in out if x.startswith("STEP") and " done" in x] == STEPS_DONE
+    for n in (2, 7, 8, 10):                                   # expected calls / passes before the GPU part
         i_plan = next(i for i, x in enumerate(out) if x.startswith(f"STEP {n} expected"))
         i_done = next(i for i, x in enumerate(out) if x.startswith(f"STEP {n} done"))
         assert i_plan < i_done
@@ -117,22 +162,73 @@ def test_runs_every_step_in_order_and_a_rerun_skips_everything(project: dict[str
     assert set(led.values) >= {"checker_sha256", "s1_check_dev", "s2_generate_enforced", "s3_enforce_filter",
                                "s4_evaluate", "s5_check_test", "s6_text_metrics", "s7_probe_targets", "s7_run_probe",
                                "probe_threshold_sha256", "s7_analyze_probe", "s8_probe_targets", "s8_run_probe",
-                               "s8_analyze_probe", "s9_make_tables"}
+                               "s8_analyze_probe", "s9_make_tables", "s10_probe_targets", "s10_run_probe",
+                               "s10_analyze_probe", "s11_sheets", "s11_relevance", "s12_make_tables"}
     gen = next(c for c in cli.calls if c[0] == "generate" and "--plan-only" not in c)
     assert gen[gen.index("--checker-sha256") + 1] == led.get("checker_sha256") and "--yes" in gen
     assert gen[gen.index("--retrieval-run") + 1] == INPUTS["test_retrieval"]
     ev = next(c for c in cli.calls if c[0] == "evaluate")
     assert led.get("s2_generate_enforced") in ev and led.get("s3_enforce_filter") in ev
-    test_probe = [c for c in cli.calls if c[0] in ("run-probe", "analyze-probe")][-3:]
+    test_probe = [c for c in cli.calls if c[0] in ("run-probe", "analyze-probe")][-6:]
     assert all(c[c.index("--threshold-sha256") + 1] == led.get("probe_threshold_sha256") for c in test_probe)
     mt = cli.calls[-1]
     assert mt[mt.index("--evaluate-run") + 1: mt.index("--evaluate-run") + 3] == [INPUTS["test_evaluation"],
                                                                                 led.get("s4_evaluate")]
 
+    prefix_rp = [c for c in cli.calls if c[0] == "run-probe"][-2:]           # step 10: plan and run
+    assert all(c[c.index("--reuse-scores") + 1] == led.get("s8_run_probe") for c in prefix_rp)
+    assert mt[mt.index("--probe-run") + 1] == led.get("s10_analyze_probe")
+    assert "--label-sheet" not in mt and "--retrieval-metrics-run" not in mt          # nothing labeled yet
+    assert out[out.index("ALL STEPS DONE") + 1] == "LABELING"
+    s11, rel = led.get("s11_sheets"), led.get("s11_relevance")
+    for sheet in (project["root"] / "runs" / s11 / "manual_review_sheet.csv",
+                  project["root"] / "runs" / s11 / "relabel_sheet.csv",
+                  project["root"] / "runs" / rel / "relevance_to_label.csv"):
+        assert f"      python -m ehr_rag.cli label --sheet {sheet}" in out, sheet
+
     again = FakeCLI(project["root"])
     out2 = _run(project, again)
     assert again.calls == []                                      # nothing runs, not even a plan
-    assert sum("skipped" in x for x in out2) == 14 and out2[-1] == "ALL STEPS DONE"
+    assert sum("skipped" in x for x in out2) == 20 and "ALL STEPS DONE" in out2
+
+
+def test_step12_reruns_tables_when_sheets_are_filled_or_changed(project: dict[str, Any]) -> None:
+    _run(project, FakeCLI(project["root"]))
+    led = Ledger(project["ids"])
+    runs = project["root"] / "runs"
+    man = runs / led.get("s11_sheets") / "manual_review_sheet.csv"
+    rel = runs / led.get("s11_relevance") / "relevance_to_label.csv"
+    first_tables = led.get("s12_make_tables")
+
+    fill(man, "label", "supported")                       # manual sheet done, re-label and relevance not yet
+    cli = FakeCLI(project["root"])
+    out = _run(project, cli)
+    assert _cmds(cli) == ["make-tables"] and any("inputs changed" in x for x in out)
+    mt = cli.calls[0]
+    assert mt[mt.index("--label-sheet") + 1] == str(man) and "--relabel-sheet" not in mt
+    assert "--retrieval-metrics-run" not in mt
+    assert Ledger(project["ids"]).get("s12_make_tables") != first_tables
+    assert f"      python -m ehr_rag.cli label --sheet {man}" not in out
+    assert f"      python -m ehr_rag.cli label --sheet {rel}" in out
+
+    fill(man.with_name("relabel_sheet.csv"), "label", "unsupported")
+    fill(rel, "relevant", "1")
+    cli = FakeCLI(project["root"])
+    out = _run(project, cli)
+    assert _cmds(cli) == ["retrieval-metrics", "make-tables"]
+    assert cli.calls[0][cli.calls[0].index("--labels") + 1] == str(rel)
+    mt = cli.calls[1]
+    assert mt[mt.index("--retrieval-metrics-run") + 1] == Ledger(project["ids"]).get("s12_retrieval_metrics")
+    assert "--relabel-sheet" in mt and "  every sheet is fully labeled" in out
+
+    cli = FakeCLI(project["root"])
+    _run(project, cli)
+    assert cli.calls == []                                # unchanged inputs: nothing again
+
+    fill(man, "label", "contradicted")                    # a corrected label: tables again, metrics kept
+    cli = FakeCLI(project["root"])
+    _run(project, cli)
+    assert _cmds(cli) == ["make-tables"]
 
 
 def test_interrupted_run_probe_resumes_with_the_same_run(project: dict[str, Any]) -> None:
@@ -174,7 +270,8 @@ def test_dry_run_runs_nothing(project: dict[str, Any]) -> None:
     cli = FakeCLI(project["root"])
     out = _run(project, cli, dry=True)
     assert cli.calls == [] and not project["ids"].exists()
-    assert sum("would start" in x for x in out) == 13 and out[-1] == "DRY RUN complete"
+    assert sum("would start" in x for x in out) == 19 and "DRY RUN complete" in out
+    assert "labeling sheets not made yet (step 11)" in out[-1]
     assert any("would run probe-threshold" in x for x in out)
     cli2 = FakeCLI(project["root"], fail={"run-probe": 1})
     with pytest.raises(StepError):
