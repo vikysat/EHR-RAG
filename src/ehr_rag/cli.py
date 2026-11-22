@@ -403,7 +403,7 @@ def cmd_export_relevance(args: argparse.Namespace) -> int:
 
     cfg = load_config(args.config)
     seed = cfg["eval"]["seed"]
-    run = start_run(cfg, "export-relevance", command="export-relevance", seed=seed)
+    run = start_run(cfg, "export-relevance", command="export-relevance", seed=seed, run_id=args.run_id)
     ids = _selected_ids(cfg, args)
     units = _load_all_units(cfg, ids)
     all_pairs = []
@@ -411,7 +411,10 @@ def cmd_export_relevance(args: argparse.Namespace) -> int:
         qs = section_queries(cfg["retrieval"]["queries"], primary_dx(units[h]))
         all_pairs.extend((h, q) for s in SECTIONS for q in qs[s])
     all_pairs = sorted(set(all_pairs))
-    pairs = sample_pairs(all_pairs, cfg["retrieval"]["relevance_export_pairs"], seed)
+    n_pairs = args.n_pairs if args.n_pairs is not None else cfg["retrieval"]["relevance_export_pairs"]
+    if n_pairs < 1:
+        raise ConfigError("--n-pairs must be >= 1")
+    pairs = sample_pairs(all_pairs, n_pairs, seed)
     enc = _encoders(cfg)
     retrievers: dict = {}
     items = []
@@ -452,7 +455,7 @@ def cmd_retrieval_metrics(args: argparse.Namespace) -> int:
     rankings_path = Path(args.rankings) if args.rankings else labels_path.parent / "relevance_rankings.json"
     rankings = json.loads(rankings_path.read_text(encoding="utf-8"))
     metrics = compute_metrics(read_labels(labels_path), rankings)
-    run = start_run(cfg, "retrieval-metrics", command="retrieval-metrics")
+    run = start_run(cfg, "retrieval-metrics", command="retrieval-metrics", run_id=args.run_id)
     run.write_json("retrieval_metrics.json", {**metrics, "labels": str(labels_path),
                                               "rankings": str(rankings_path)})
     print(f"{'method':<10} {'Recall@5':>9} {'MRR':>7} {'pairs':>6}")
@@ -1161,20 +1164,34 @@ def cmd_make_tables(args: argparse.Namespace) -> int:
             for k in ("check_run", "text_metrics_run", "audit_run", "probe_run")}
     eval_dirs = [_run_dir(cfg, e, "evaluate") for e in (args.evaluate_run or [])]
     dirs = {"evaluate_run": eval_dirs or None, **dirs}
-    if not any(dirs.values()):
-        raise ConfigError("give at least one of --evaluate-run, --check-run, --text-metrics-run, --audit-run, "
-                          "--probe-run")
     manual = Path(args.manual_labels) if args.manual_labels else None
+    if bool(args.label_sheet) != bool(args.label_key):
+        raise ConfigError("give --label-sheet and --label-key together")
+    if args.relabel_sheet and not args.label_sheet:
+        raise ConfigError("--relabel-sheet needs --label-sheet and --label-key")
+    sheets = None
+    if args.label_sheet:
+        sheets = {"sheet": Path(args.label_sheet), "key": Path(args.label_key),
+                  "relabel": Path(args.relabel_sheet) if args.relabel_sheet else None}
+        missing = [str(v) for v in sheets.values() if v is not None and not v.exists()]
+        if missing:
+            raise ConfigError(f"label file(s) not found: {missing}")
+    rm_dir = _run_dir(cfg, args.retrieval_metrics_run, "retrieval-metrics") if args.retrieval_metrics_run else None
+    if not any(dirs.values()) and not sheets and rm_dir is None:
+        raise ConfigError("give at least one of --evaluate-run, --check-run, --text-metrics-run, --audit-run, "
+                          "--probe-run, --label-sheet, --retrieval-metrics-run")
     run = start_run(cfg, "make-tables", command="make-tables", seed=cfg["audit"]["seed"], run_id=args.run_id)
     counts = make_tables(run.path, eval_dir=dirs["evaluate_run"], manual=manual, check_dir=dirs["check_run"],
                          tm_dir=dirs["text_metrics_run"], audit_dir=dirs["audit_run"], probe_dir=dirs["probe_run"],
-                         n=cfg["audit"]["bootstrap_resamples"], seed=cfg["audit"]["seed"])
+                         n=cfg["audit"]["bootstrap_resamples"], seed=cfg["audit"]["seed"], label_sheets=sheets,
+                         retrieval_dir=rm_dir)
     for name, k in counts.items():
         print(f"table {name}: {k} rows")
     print(f"wrote tables.md and table_*.md to {run.path}")
     run.finish(sources={k: ([x.name for x in v] if isinstance(v, list) else v.name if v else None)
                         for k, v in dirs.items()}, manual_labels=args.manual_labels,
-               rows=counts)
+               label_sheets={k: str(v) for k, v in (sheets or {}).items() if v is not None} or None,
+               retrieval_metrics_run=args.retrieval_metrics_run, rows=counts)
     return 0
 
 
@@ -1248,6 +1265,76 @@ def cmd_analyze_perturbation(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_labeling_sheets(args: argparse.Namespace) -> int:
+    """Hand-labeling sheets: manual review (condition hidden, key kept apart) and a re-label sheet. Counts only."""
+    import json
+
+    from ehr_rag.config import ALL_CONDITIONS
+    from ehr_rag.labeling import LabelingError, build_sheets, write_sheets
+    from ehr_rag.runs import start_run
+
+    cfg = load_config(args.config)
+    bad = sorted(set(args.conditions) - set(ALL_CONDITIONS))
+    if bad:
+        raise ConfigError(f"unknown condition(s) {bad}")
+    eval_dirs = [_run_dir(cfg, e, "evaluate") for e in args.evaluate_run]
+    sentences: list[dict] = []
+    owner: dict[tuple[str, int], str] = {}
+    gen_dirs: dict[str, list] = {}
+    for d in eval_dirs:
+        rows = [json.loads(x) for x in (d / "sentences.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()]
+        rows = [r for r in rows if r["condition"] in args.conditions]
+        for k in {(r["condition"], int(r["hadm_id"])) for r in rows}:
+            if k in owner:
+                raise ConfigError(f"condition {k[0]} of one admission is in both evaluate runs {owner[k]} and {d.name}")
+            owner[k] = d.name
+        sentences.extend({**r, "evaluate_run": d.name} for r in rows)
+        g = json.loads((d / "run_meta.json").read_text(encoding="utf-8")).get("generation_run")
+        gen_dirs[d.name] = [_run_dir(cfg, x, "generation") for x in ([g] if isinstance(g, str) else g or [])]
+
+    def texts(condition: str, hadm_id: int) -> dict[str, str]:
+        for gd in gen_dirs[owner[(condition, hadm_id)]]:
+            p = gd / condition / str(hadm_id) / "evidence_shown.json"
+            if p.exists():
+                return {u["unit_id"]: u["text"] for u in json.loads(p.read_text(encoding="utf-8"))["units"]}
+        raise ConfigError(f"no evidence_shown.json for {condition} {anonymize.admission(hadm_id)}")
+
+    run = start_run(cfg, "labeling-sheets", command="labeling-sheets", seed=cfg["eval"]["seed"], run_id=args.run_id)
+    try:
+        built = build_sheets(sentences, texts, anonymize.label, n=args.n, n_relabel=args.n_relabel,
+                             seed=cfg["eval"]["seed"], conditions=tuple(args.conditions))
+    except LabelingError as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        run.finish(status="failed", error=str(e))
+        return 4
+    paths = write_sheets(run.path, built)
+    print(f"manual review sheet: {len(built['manual'])} sentences from {len(built['manual'])} admissions; "
+          f"re-label sheet: {len(built['relabel'])} of them in a new order")
+    print(f"items per condition|section: {built['cells']}")
+    for p in paths.values():
+        print(f"wrote {p}")
+    print(f"label with: python -m ehr_rag.cli label --sheet {paths['manual']}")
+    run.finish(evaluate_runs=args.evaluate_run, conditions=args.conditions, n=len(built["manual"]),
+               n_relabel=len(built["relabel"]), cells=built["cells"])
+    return 0
+
+
+def cmd_label(args: argparse.Namespace) -> int:
+    """Terminal labeler: one item at a time, saved after every answer, resumes where it stopped."""
+    from pathlib import Path
+
+    from ehr_rag.labeling import LabelingError, label_sheet
+
+    try:
+        label_sheet(Path(args.sheet))
+    except LabelingError as e:
+        print(f"STOP - {e}", file=sys.stderr)
+        return 4
+    except KeyboardInterrupt:
+        print("\ninterrupted; every answer so far is saved")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser with all subcommands."""
     parser = argparse.ArgumentParser(
@@ -1299,10 +1386,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Phase 3: write relevance_to_label.csv (pooled top-10 of BM25/dense/fused) for manual labeling.")
     p.add_argument("--split", nargs="+", choices=["dev", "test"],
                    help="cohort split(s) from select-cohort (hash-checked) instead of selected_admissions.yaml")
+    p.add_argument("--n-pairs", type=int,
+                   help="(admission, query) pairs to sample (default: retrieval.relevance_export_pairs)")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("retrieval-metrics", cmd_retrieval_metrics,
             "Phase 3: Recall@5 and MRR per method from a labeled relevance CSV (pooled relevance).")
     p.add_argument("--labels", required=True, help="labeled relevance_to_label.csv")
     p.add_argument("--rankings", help="relevance_rankings.json (default: next to --labels)")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("generate", cmd_generate, "Phase 4: generate reports per condition for the selected admissions.")
     p.add_argument("--conditions", nargs="+",
                    help="subset of no_retrieval ehr_rag full_context ehr_rag_enforced full_context_enforced "
@@ -1409,7 +1500,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threshold-sha256", help="required on the test split: the sha256 printed by probe-threshold")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
     p = add("make-tables", cmd_make_tables,
-            "Markdown tables (support, audit, enforcement, checker profile, reference metrics, probe) with 95%% CIs.")
+            "Markdown tables (support, audit, enforcement, checker profile, reference metrics, probe, manual labels, "
+            "retrieval) with 95%% CIs.")
     p.add_argument("--evaluate-run", nargs="+",
                    help="run id(s) of `evaluate` runs (table 1); several are merged, e.g. base + enforced/filtered")
     p.add_argument("--manual-labels", help="labeled manual_review.csv (table 1, manual unsupported)")
@@ -1417,7 +1509,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text-metrics-run", help="run id of a `text-metrics` run (table 5)")
     p.add_argument("--audit-run", help="run id of an `analyze-audit` run (table 2)")
     p.add_argument("--probe-run", help="run id of an `analyze-probe` run (table 6)")
+    p.add_argument("--label-sheet", help="labeled manual_review_sheet.csv from labeling-sheets (table 7)")
+    p.add_argument("--label-key", help="its labeling_key.csv (conditions and NLI results)")
+    p.add_argument("--relabel-sheet", help="labeled relabel_sheet.csv (table 7, intra-annotator kappa)")
+    p.add_argument("--retrieval-metrics-run", help="run id of a `retrieval-metrics` run (table 8)")
     p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
+    p = add("labeling-sheets", cmd_labeling_sheets,
+            "Hand-labeling sheets: N sentences from N admissions (conditions and sections mixed, condition hidden in "
+            "a separate key file) and a re-label sheet of some of them in a new order.")
+    p.add_argument("--evaluate-run", required=True, nargs="+",
+                   help="run id(s) of `evaluate` runs with the conditions' sentences (e.g. test + enforced)")
+    p.add_argument("--conditions", nargs="+", default=["ehr_rag", "ehr_rag_enforced"],
+                   help="conditions to mix (default: ehr_rag ehr_rag_enforced)")
+    p.add_argument("--n", type=int, default=50, help="sentences, one per admission (default 50)")
+    p.add_argument("--n-relabel", type=int, default=15, help="items repeated on the re-label sheet (default 15)")
+    p.add_argument("--run-id", help="explicit run id YYYYMMDD-HHMMSS-<name>")
+    p = add("label", cmd_label,
+            "Terminal labeler for a sheet (manual review: keys 1-4; retrieval relevance: y/n; s skip, b back, "
+            "q quit). Saves after every item and resumes where it stopped.")
+    p.add_argument("--sheet", required=True, help="the sheet to label (CSV)")
     p = add("run-pilot", cmd_run_pilot,
             "Phase 6: frozen-evidence regenerations for every edit plus unperturbed controls.")
     p.add_argument("--targets-run", required=True, help="run id of a `select-targets` run")

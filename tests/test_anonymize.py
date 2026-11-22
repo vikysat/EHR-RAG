@@ -153,6 +153,26 @@ def pipeline(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Any
         "--run-id", "20990101-000006-analyze-audit")
     run("make-tables", "make-tables", "--evaluate-run", "20990101-000003-evaluate",
         "--check-run", "20990101-000002-check-citations", "--audit-run", "20990101-000006-analyze-audit")
+    # labeling sheets, the labeler, retrieval metrics and the tables with the labels
+    from itertools import cycle
+
+    from ehr_rag.labeling import label_sheet
+
+    run("labeling-sheets", "labeling-sheets", "--evaluate-run", "20990101-000003-evaluate", "--n", "2",
+        "--n-relabel", "1", "--run-id", "20990101-000008-labeling-sheets")
+    sheets = root / "runs" / "20990101-000008-labeling-sheets"
+    keys = cycle("1342")
+    label_sheet(sheets / "manual_review_sheet.csv", key=lambda: next(keys), out=lambda s: None)
+    label_sheet(sheets / "relabel_sheet.csv", key=lambda: "3", out=lambda s: None)
+    run("export-relevance-dev", "export-relevance", "--split", "dev", "--n-pairs", "1",
+        "--run-id", "20990101-000009-export-relevance")
+    rel = root / "runs" / "20990101-000009-export-relevance" / "relevance_to_label.csv"
+    yn = cycle("yn")
+    label_sheet(rel, key=lambda: next(yn), out=lambda s: None)
+    run("retrieval-metrics", "retrieval-metrics", "--labels", str(rel), "--run-id", "20990101-000010-retrieval-metrics")
+    run("make-tables-labels", "make-tables", "--label-sheet", str(sheets / "manual_review_sheet.csv"),
+        "--label-key", str(sheets / "labeling_key.csv"), "--relabel-sheet", str(sheets / "relabel_sheet.csv"),
+        "--retrieval-metrics-run", "20990101-000010-retrieval-metrics", "--run-id", "20990101-000011-make-tables")
     run("select-targets", "select-targets", "--generation-run", gen)
     run("run-pilot", "run-pilot", "--targets-run", latest(root, "select-targets"), "--yes",
         "--run-id", "20990101-000007-run-pilot")
@@ -220,6 +240,22 @@ def test_real_ids_stay_in_the_run_folders(pipeline: dict[str, Any]) -> None:
         assert [r["hadm_id"] for r in csv.DictReader(f)] == ["92000021", "92000012"]
     for run in (build, gen, runs / pipeline["retrieve"], runs / "20990101-000005-run-audit"):
         assert (run / "admission_aliases.csv").read_text(encoding="utf-8") == ALIASES_CSV, run.name
+
+
+def test_labeling_sheets_show_aliases_and_hide_the_condition(pipeline: dict[str, Any]) -> None:
+    runs = pipeline["root"] / "runs"
+    sheets = runs / "20990101-000008-labeling-sheets"
+    for name in ("manual_review_sheet.csv", "relabel_sheet.csv", "labeling_key.csv"):
+        assert_no_ids((sheets / name).read_text(encoding="utf-8"))
+    with (sheets / "manual_review_sheet.csv").open(encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert sorted(r["admission"] for r in rows) == ["adm_001", "adm_002"]
+    assert "condition" not in rows[0] and all(r["label"] for r in rows)
+    tables = (runs / "20990101-000011-make-tables" / "tables.md").read_text(encoding="utf-8")
+    assert "## Table 7." in tables and "## Table 8." in tables and "intra-annotator (4 labels)" in tables
+    assert_no_ids(tables)
+    out = pipeline["out"]["labeling-sheets"][1]
+    assert "manual review sheet: 2 sentences from 2 admissions; re-label sheet: 1" in out
 
 
 # --------------------------------------------------------------------------- numbering and error paths

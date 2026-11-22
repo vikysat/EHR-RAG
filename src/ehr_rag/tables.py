@@ -12,6 +12,10 @@ seeded with ``audit.seed``). Sources (each table is written only if its source i
   5 reference    text-metrics run: text_metrics.csv (mean F1 per condition)
   6 probe        analyze-probe run: probe_summary.json (share of NLI-supported claims not dependent on the
                  cited unit; its CIs are computed by analyze-probe with ``probe.bootstrap_resamples``)
+  7 manual       labeling-sheets sheet + key (+ re-label sheet), labeled with ``label``: label distribution and
+                 unsupported rate (unsupported + contradicted) by condition and section group, Cohen's kappa
+                 human vs NLI, intra-annotator kappa (``ehr_rag/labeling.py``)
+  8 retrieval    retrieval-metrics run: retrieval_metrics.json (Recall@5 and MRR per method, pooled relevance)
 """
 
 from __future__ import annotations
@@ -223,9 +227,50 @@ def table_probe(probe_dir: Path) -> tuple[list[str], int]:
     return lines + _md(header, rows), len(rows)
 
 
+# --------------------------------------------------------------------------- table 7: manual labels
+
+
+def table_manual(sheets: dict[str, Path | None], n: int, seed: int) -> tuple[list[str], int]:
+    from ehr_rag.labeling import LABELS, analyze_labels
+
+    sheet, key = sheets["sheet"], sheets["key"]
+    assert sheet is not None and key is not None
+    a = analyze_labels(sheet, key, sheets.get("relabel"), n, seed, GROUPS)
+    header = ["condition", "sections", "labeled", *LABELS, "unsupported rate"]
+    rows = [[r["condition"], r["sections"], str(r["n"]), *(str(r["counts"][lab]) for lab in LABELS),
+             fmt_ci(r["unsupported_rate"])] for r in a["rates"]]
+    agree = [[f"NLI vs human: {r['condition']}", str(r["n"]), f"{r['raw_agreement']:.3f}", fmt_ci(r["kappa"])]
+             for r in a["nli_agreement"]]
+    ia = a["intra_annotator"]
+    if ia:
+        agree.append(["intra-annotator (4 labels)", str(ia["n"]), f"{ia['raw_agreement']:.3f}", fmt_ci(ia["kappa"])])
+        agree.append(["intra-annotator (supported vs not)", str(ia["n"]), "", fmt_ci(ia["kappa_binary"])])
+    lines = ["## Table 7. Manual review of sentences (plain and enforced ehr_rag; condition hidden while labeling)",
+             "",
+             "Unsupported rate = (unsupported + contradicted) / labeled; 95% CI from bootstrap resamples of "
+             "admissions (one sentence per admission). NLI vs human: Cohen's kappa between human supported "
+             "(partially supported counts as not supported) and the NLI verdict on the claim's cited units. "
+             "Intra-annotator: the same items labeled again in a new order.", ""]
+    lines += _md(header, rows) + ["", *_md(["agreement", "items", "raw agreement", "Cohen's kappa"], agree)]
+    return lines, len(rows) + len(agree)
+
+
+# --------------------------------------------------------------------------- table 8: retrieval
+
+
+def table_retrieval(rm_dir: Path) -> tuple[list[str], int]:
+    m = json.loads((rm_dir / "retrieval_metrics.json").read_text(encoding="utf-8"))
+    rows = [[k, f"{v['recall@5']:.3f}", f"{v['mrr']:.3f}", str(v["n_pairs"])] for k, v in m["methods"].items()]
+    skipped = len(m.get("skipped_no_relevant", []))
+    lines = ["## Table 8. Retrieval on hand-labeled dev queries", "",
+             f"{m.get('note', '')} Pairs with no relevant pooled unit are left out ({skipped}).", ""]
+    return lines + _md(["method", "Recall@5", "MRR", "pairs"], rows), len(rows)
+
+
 def make_tables(out_dir: Path, *, eval_dir: Path | list[Path] | None, manual: Path | None, check_dir: Path | None,
                 tm_dir: Path | None, audit_dir: Path | None, n: int, seed: int,
-                probe_dir: Path | None = None) -> dict[str, int]:
+                probe_dir: Path | None = None, label_sheets: dict[str, Path | None] | None = None,
+                retrieval_dir: Path | None = None) -> dict[str, int]:
     """Write ``table_<k>_<name>.md`` per available source and ``tables.md``; returns rows per table."""
     parts: list[tuple[str, tuple[list[str], int]]] = []
     if eval_dir:
@@ -239,9 +284,16 @@ def make_tables(out_dir: Path, *, eval_dir: Path | list[Path] | None, manual: Pa
         parts.append(("5_reference", table_reference(tm_dir, n, seed)))
     if probe_dir:
         parts.append(("6_probe", table_probe(probe_dir)))
+    if label_sheets:
+        parts.append(("7_manual", table_manual(label_sheets, n, seed)))
+    if retrieval_dir:
+        parts.append(("8_retrieval", table_retrieval(retrieval_dir)))
+    ls = label_sheets or {}
     sources = {"evaluate": eval_dir, "manual labels": manual, "check-citations": check_dir,
                "text-metrics": tm_dir, "analyze-audit": audit_dir,
-               "analyze-probe": probe_dir}
+               "analyze-probe": probe_dir,
+               "label sheet": ls.get("sheet") and ls["sheet"].parent, "re-label sheet": ls.get("relabel"),
+               "retrieval-metrics": retrieval_dir}
     def names(v: Any) -> str:
         return ", ".join(f"`{x.name}`" for x in v) if isinstance(v, list) else f"`{v.name}`"
 
